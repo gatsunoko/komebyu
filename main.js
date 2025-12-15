@@ -2,7 +2,11 @@ const { app, BrowserWindow, ipcMain } = require("electron");
 const path = require("path");
 const tmi = require("tmi.js");
 const WebSocket = require("ws");
-const { decodeNdgrPayload, extractStreamMetaFromDecoded } = require("./proto/ndgr");
+const {
+  decodeMessageServerPayload,
+  extractSegmentUrisFromView,
+} = require("./proto/messageServer");
+const { decodeSegmentPayload } = require("./proto/segmentServer");
 
 const NICO_DEBUG = process.env.NICO_DEBUG !== "false";
 
@@ -199,10 +203,6 @@ function decodeRoom(buf) {
   return data;
 }
 
-function decodeNdgrMessage(buf) {
-  return decodeNdgrPayload(buf);
-}
-
 let win = null;
 const connections = new Map();
 
@@ -304,7 +304,7 @@ async function connectNiconico(liveUrlOrId) {
     return;
   }
 
-  let ndgrAbort = null;
+  let viewAbort = null;
 
   const connection = {
     id,
@@ -312,7 +312,7 @@ async function connectNiconico(liveUrlOrId) {
     label: `ニコ生 ${liveId}`,
     status: "ニコ生に接続中…",
     disconnect: async () => {
-      if (ndgrAbort) ndgrAbort.abort();
+      if (viewAbort) viewAbort.abort();
     },
   };
 
@@ -400,35 +400,25 @@ async function connectNiconico(liveUrlOrId) {
     setStatus(`step2a: watch WS url = ${watchWsUrl}`);
 
     const connectionAbortController = new AbortController();
-    let reconnectTimer = null;
     let messageCount = 0;
-    let currentStreamUrl = null;
-    let ndgrRunning = false;
-    let ndgrUrl = null;
-    let currentStreamPromise = null;
-    let ndgrReconnectDelay = 1000;
     let viewUri = null;
-    let nextStreamAt = null;
     let segmentUrl = null;
     let segmentAbort = null;
     let segmentPromise = null;
     let segmentRunning = false;
     let segmentReconnectDelay = 1000;
+    let segmentCursor = null;
     let watchSocket = null;
     let watchKeepTimer = null;
     let watchReconnectTimer = null;
     let watchReconnectDelay = 1000;
 
     connectionAbortController.signal.addEventListener("abort", () => {
-      ndgrAbort?.abort();
+      viewAbort?.abort();
       segmentAbort?.abort();
     });
 
     const cleanup = () => {
-      if (reconnectTimer) {
-        clearTimeout(reconnectTimer);
-        reconnectTimer = null;
-      }
       if (watchReconnectTimer) {
         clearTimeout(watchReconnectTimer);
         watchReconnectTimer = null;
@@ -444,7 +434,7 @@ async function connectNiconico(liveUrlOrId) {
         watchSocket = null;
       }
       connectionAbortController.abort();
-      ndgrAbort?.abort();
+      viewAbort?.abort();
       segmentAbort?.abort();
     };
 
@@ -459,13 +449,6 @@ async function connectNiconico(liveUrlOrId) {
       const joiner = uri.includes("?") ? "&" : "?";
       return `${uri}${joiner}at=${encodeURIComponent(atValue)}`;
     }
-  };
-
-  const extractStreamMeta = (buf) => {
-    const decoded = decodeNdgrMessage(buf);
-    const meta = extractStreamMetaFromDecoded(decoded, buf);
-    logNico("ndgr decoded meta", meta);
-    return meta;
   };
 
   const connectSegmentStream = async (uri) => {
@@ -535,11 +518,7 @@ async function connectNiconico(liveUrlOrId) {
               continue;
             }
 
-            const headerByte = buffer[headerOffset];
-            const payload = buffer.slice(
-              headerOffset + 1,
-              headerOffset + messageLength
-            );
+            const payload = buffer.slice(headerOffset + 1, headerOffset + messageLength);
             const rawChunk = buffer.slice(headerOffset, headerOffset + messageLength);
             buffer = buffer.slice(headerOffset + messageLength);
 
@@ -552,9 +531,9 @@ async function connectNiconico(liveUrlOrId) {
             }
 
             try {
-              const decoded = decodeNdgrMessage(payload, headerByte);
+              const decoded = decodeSegmentPayload(payload);
               if (decoded && Object.keys(decoded).length) {
-                handleMessage(decoded);
+                handleSegmentMessage(decoded);
               }
             } catch (e) {
               logNico("segment decode error", e);
@@ -576,22 +555,26 @@ async function connectNiconico(liveUrlOrId) {
 
     segmentRunning = false;
     segmentAbort = null;
-    segmentUrl = null;
 
     logNico("segmentServer ended", { reason, totalBytes });
     setStatus(`segmentServer end ${reason} bytes=${totalBytes}`);
 
     if (!connectionAbortController.signal.aborted && reason !== "abort") {
-      setTimeout(() => connectSegmentStream(uri), segmentReconnectDelay);
+      const nextUri = segmentUrl || ensureAtParam(uri, segmentCursor || "now");
+      setTimeout(() => connectSegmentStream(nextUri), segmentReconnectDelay);
       segmentReconnectDelay = Math.min(segmentReconnectDelay * 2, 30000);
     }
   };
 
-  const handleMessage = (msg) => {
+  const handleSegmentMessage = (msg) => {
     if (!msg) return;
     if (msg.ping) return;
     if (msg.serverTime) return;
     if (msg.statistics) return;
+
+    if (msg.cursor) {
+      segmentCursor = msg.cursor;
+    }
 
     if (msg.error) {
       setStatus(`ニコ生エラー: ${msg.error.code || msg.error.message || "unknown"}`);
@@ -604,28 +587,10 @@ async function connectNiconico(liveUrlOrId) {
       return;
     }
 
-    if (msg.reconnectAt) {
-      if (msg.reconnectAt.at) {
-        nextStreamAt = msg.reconnectAt.at;
-        logNico("nextStreamAt(from reconnect)", nextStreamAt);
-        setStatus(`nextStreamAt = ${nextStreamAt}`);
-      }
-      const delay = Number(msg.reconnectAt.at || 0) - Date.now();
-      const waitMs = Number.isFinite(delay) && delay > 0 ? delay : 1000;
-      logNico("NDGR reconnectAt", msg.reconnectAt, "waitMs", waitMs);
-      if (reconnectTimer) clearTimeout(reconnectTimer);
-      reconnectTimer = setTimeout(() => {
-        connectStream(msg.reconnectAt.streamUrl || currentStreamUrl);
-      }, waitMs);
-      return;
-    }
-
-    if (msg.room) {
-      const roomInfo = msg.room.messageServer || msg.room;
-      const uri =
-        roomInfo.messageServerUrl || roomInfo.url || roomInfo.uri || currentStreamUrl;
-      logNico("room message", roomInfo);
-      setStatus(`step4: NDGRストリーム接続開始 ${uri}`);
+    if (msg.reconnect) {
+      if (msg.reconnect.cursor) segmentCursor = msg.reconnect.cursor;
+      if (msg.reconnect.at) segmentCursor = msg.reconnect.at;
+      if (msg.reconnect.streamUrl) segmentUrl = msg.reconnect.streamUrl;
       return;
     }
 
@@ -650,220 +615,97 @@ async function connectNiconico(liveUrlOrId) {
     const connectStream = async (targetUrl) => {
       if (connectionAbortController.signal.aborted) return;
 
-      if (ndgrRunning && targetUrl === ndgrUrl) {
-        logNico("NDGR stream already running for", targetUrl);
-        return;
+      if (viewAbort) {
+        viewAbort.abort();
       }
 
-      if (ndgrRunning) {
-        ndgrAbort?.abort();
-        if (currentStreamPromise) {
-          await currentStreamPromise.catch(() => {});
-        }
-      }
+      viewAbort = new AbortController();
+      const localAbort = viewAbort;
 
-      ndgrAbort = new AbortController();
-      ndgrRunning = true;
-      ndgrUrl = targetUrl;
+      const logDecodeError = (err) => {
+        logNico("view decode error", err);
+      };
 
-      const localAbort = ndgrAbort;
-
-      const runStream = async () => {
-        const abortHandler = () => localAbort.abort();
-        connectionAbortController.signal.addEventListener("abort", abortHandler);
-
-        let stallTimer = null;
+      const runView = async () => {
         let buffer = Buffer.alloc(0);
-        let totalBytes = 0;
-        let lastBytes = 0;
-        let reconnectReason = "done";
         let firstChunkLogged = false;
 
         try {
-          updateConnectionStatus(id, "NDGR コメントストリーム接続中…");
-          setStatus(`step4: ストリーム接続開始 ${targetUrl}`);
-          currentStreamUrl = targetUrl;
+          updateConnectionStatus(id, "NDGR ビュー取得中…");
+          setStatus(`step3: view/v4 接続 ${targetUrl}`);
 
-          let response;
-          try {
-            response = await fetch(targetUrl, {
-              signal: localAbort.signal,
-              headers: {
-                "User-Agent": "komebyu/1.0 (+https://github.com/)",
-                Accept: "application/octet-stream",
-                header: "u=1, i",
-              },
-            });
-          } catch (e) {
-            if (localAbort.signal.aborted || connectionAbortController.signal.aborted) {
-              reconnectReason = "abort";
-              return { reason: reconnectReason, totalBytes };
-            }
-            reconnectReason = "fetch-error";
-            setStatus(`NDGR接続失敗: ${e?.message || String(e)}`);
-            return { reason: reconnectReason, totalBytes };
-          }
+          const response = await fetch(targetUrl, {
+            signal: localAbort.signal,
+            headers: {
+              "User-Agent": "komebyu/1.0 (+https://github.com/)",
+              Accept: "application/octet-stream",
+            },
+          });
 
-          logNico(
-            "NDGR stream status",
-            response.status,
-            "content-type",
-            response.headers.get("content-type")
-          );
           if (!response.ok || !response.body) {
-            reconnectReason = `bad-status-${response.status}`;
-            setStatus(`NDGRストリーム取得失敗 (${response.status})`);
-            return { reason: reconnectReason, totalBytes };
+            setStatus(`view/v4 取得失敗 (${response.status})`);
+            return;
           }
 
           const reader = response.body.getReader();
-          updateConnectionStatus(id, "NDGR コメント受信中");
-
-          stallTimer = setInterval(() => {
-            if (localAbort.signal.aborted) return;
-            if (totalBytes === lastBytes) {
-              logNico(
-                "ndgr stream stalled (no new bytes for 5s)",
-                "url",
-                targetUrl,
-                "total",
-                totalBytes
-              );
-            }
-            lastBytes = totalBytes;
-          }, 5000);
-
           while (true) {
-            let chunk;
-            try {
-              const { done, value } = await reader.read();
-              if (done) {
-                reconnectReason = "done";
-                break;
-              }
-              if (!value) continue;
-              chunk = Buffer.from(value);
-            } catch (e) {
-              if (localAbort.signal.aborted || connectionAbortController.signal.aborted) {
-                reconnectReason = "abort";
-                break;
-              }
-              reconnectReason = "read-error";
-              setStatus(`NDGR読込エラー: ${e?.message || String(e)}`);
-              break;
-            }
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (!value) continue;
 
-            if (chunk && chunk.length) {
-              totalBytes += chunk.length;
-              logNico("ndgr bytes", chunk.length, "total", totalBytes);
-              buffer = Buffer.concat([buffer, chunk]);
-            }
+            buffer = Buffer.concat([buffer, Buffer.from(value)]);
 
             while (buffer.length) {
               const lengthInfo = readVarint(buffer, 0);
               if (!lengthInfo) break;
               const messageLength = Number(lengthInfo.value);
-              const start = lengthInfo.length;
-              if (buffer.length < start + messageLength) break;
+              const offset = lengthInfo.length;
+              if (buffer.length < offset + messageLength) break;
               if (messageLength < 1) {
-                buffer = buffer.slice(start + messageLength);
+                buffer = buffer.slice(offset + messageLength);
                 continue;
               }
 
-              const headerByte = buffer[start];
-              const messageBytes = buffer.slice(start + 1, start + messageLength);
-              const rawChunk = buffer.slice(start, start + messageLength);
-              buffer = buffer.slice(start + messageLength);
+              const payload = buffer.slice(offset + 1, offset + messageLength);
+              const rawChunk = buffer.slice(offset, offset + messageLength);
+              buffer = buffer.slice(offset + messageLength);
 
               if (!firstChunkLogged) {
-                logNico("messageServer chunk0", {
+                logNico("view chunk0", {
                   hex: rawChunk.toString("hex"),
                   length: rawChunk.length,
                 });
                 firstChunkLogged = true;
               }
 
-              let decoded;
               try {
-                const meta = extractStreamMeta(messageBytes);
-                if (meta.nextStreamAt && meta.nextStreamAt !== nextStreamAt) {
-                  nextStreamAt = meta.nextStreamAt;
-                  logNico("nextStreamAt updated", nextStreamAt);
-                  setStatus(`nextStreamAt = ${nextStreamAt}`);
-                }
-                if (meta.segmentUris.length) {
-                  logNico("segment URIs from meta", meta.segmentUris);
-                  const nextSegment = meta.segmentUris[0];
-                  if (nextSegment && nextSegment !== segmentUrl) {
-                    connectSegmentStream(nextSegment);
+                const decoded = decodeMessageServerPayload(payload);
+                const segmentUris = extractSegmentUrisFromView(decoded, payload);
+                if (segmentUris.length) {
+                  const nextUri = segmentUris[0];
+                  logNico("segment URIs from view", segmentUris);
+                  if (nextUri && nextUri !== segmentUrl) {
+                    const withAt = ensureAtParam(nextUri, "now");
+                    segmentUrl = withAt;
+                    connectSegmentStream(withAt);
                   }
                 }
-
-                decoded = decodeNdgrMessage(messageBytes, headerByte);
               } catch (e) {
-                logNico("ndgr decode error", e);
-                continue;
-              }
-
-              try {
-                if (decoded && Object.keys(decoded).length) {
-                  handleMessage(decoded);
-                }
-              } catch (e) {
-                logNico("ndgr handle message error", e);
+                logDecodeError(e);
               }
             }
           }
         } catch (e) {
-          if (localAbort.signal.aborted || connectionAbortController.signal.aborted) {
-            reconnectReason = "abort";
-          } else {
-            reconnectReason = "stream-error";
-            setStatus(`NDGRストリームエラー: ${e?.message || String(e)}`);
+          if (!localAbort.signal.aborted) {
+            setStatus(`view/v4 取得エラー: ${e?.message || String(e)}`);
           }
-        } finally {
-          if (stallTimer) clearInterval(stallTimer);
-          connectionAbortController.signal.removeEventListener("abort", abortHandler);
-          currentStreamUrl = null;
-          logNico(`NDGR stream ended totalBytes=${totalBytes}`, "reason", reconnectReason);
         }
-
-        return { reason: reconnectReason, totalBytes };
       };
 
-      currentStreamPromise = runStream();
+      await runView();
 
-      let streamResult = null;
-      try {
-        streamResult = await currentStreamPromise;
-      } finally {
-        const reason = streamResult?.reason || (localAbort.signal.aborted ? "abort" : "unknown");
-        const totalBytes = streamResult?.totalBytes ?? 0;
-        ndgrRunning = false;
-        ndgrUrl = null;
-        ndgrAbort = null;
-
-        if (!connectionAbortController.signal.aborted && reason !== "abort") {
-          if (totalBytes <= 16 && !nextStreamAt) {
-            nextStreamAt = Date.now() + 2000;
-          }
-          if (totalBytes <= 16) {
-            logNico("NDGR stream ended quickly", { reason, totalBytes });
-          }
-
-          const atValue = nextStreamAt ?? Date.now() + 2000;
-          const nextUrl = ensureAtParam(viewUri || targetUrl, atValue);
-          setStatus(
-            `NDGRストリームが切断されました 再接続を試行します (${reason})`
-          );
-          reconnectTimer = setTimeout(() => connectStream(nextUrl), ndgrReconnectDelay);
-          ndgrReconnectDelay = Math.min(ndgrReconnectDelay * 2, 30000);
-        } else {
-          ndgrReconnectDelay = 1000;
-        }
-
-        logNico("NDGR reconnect reason", reason, "totalBytes", totalBytes, "nextAt", nextStreamAt);
-      }
+      viewAbort = null;
+      logNico("view/v4 handling finished");
     };
 
     const handleWatchMessage = (raw) => {
@@ -904,20 +746,19 @@ async function connectNiconico(liveUrlOrId) {
       const preferredUri = akashicUri || candidateUri;
       const sourceType = akashicUri ? "akashic" : candidateUri ? "message" : "unknown";
 
-      if (preferredUri) {
-        const preview = text.slice(0, 200);
-        setStatus(`step2c: watch ws recv ${sourceType}Server ${preview}`);
+        if (preferredUri) {
+          const preview = text.slice(0, 200);
+          setStatus(`step2c: watch ws recv ${sourceType}Server ${preview}`);
 
-        if (preferredUri.includes("mpn.live.nicovideo.jp/api/view")) {
-          if (viewUri !== preferredUri || !currentStreamUrl) {
-            viewUri = preferredUri;
-            nextStreamAt = null;
-            setStatus(`step3: ndgr viewUri (${sourceType}) = ${viewUri}`);
-            connectStream(ensureAtParam(viewUri, "now"));
+          if (preferredUri.includes("mpn.live.nicovideo.jp/api/view")) {
+            if (viewUri !== preferredUri) {
+              viewUri = preferredUri;
+              setStatus(`step3: ndgr viewUri (${sourceType}) = ${viewUri}`);
+              connectStream(ensureAtParam(viewUri, "now"));
+            }
           }
         }
-      }
-    };
+      };
 
     const openWatchSocket = () => {
       if (watchSocket) {
