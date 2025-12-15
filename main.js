@@ -2,7 +2,7 @@ const { app, BrowserWindow, ipcMain } = require("electron");
 const path = require("path");
 const tmi = require("tmi.js");
 const WebSocket = require("ws");
-const { decodeChunkedEntry } = require("./proto/messageServer");
+const { decodeEntryPayload } = require("./proto/messageServer");
 const { decodeChunkedMessage } = require("./proto/segmentServer");
 
 const NICO_DEBUG = process.env.NICO_DEBUG !== "false";
@@ -343,6 +343,7 @@ async function connectNiconico(liveUrlOrId) {
     state.promise = (async () => {
       let buffer = Buffer.alloc(0);
       let firstMessageLogged = false;
+      let firstPayloadLogged = false;
 
       try {
         logNico("segmentServer uri", uri);
@@ -383,6 +384,14 @@ async function connectNiconico(liveUrlOrId) {
             buffer = buffer.slice(chunkEnd);
 
             try {
+              if (!firstPayloadLogged) {
+                logNico("segment payload", {
+                  hex: payload.slice(0, 16).toString("hex"),
+                  length: payload.length,
+                });
+                firstPayloadLogged = true;
+              }
+
               const decoded = decodeChunkedMessage(payload);
               const envelopes = Array.isArray(decoded?.message)
                 ? decoded.message
@@ -443,6 +452,7 @@ async function connectNiconico(liveUrlOrId) {
       try {
         let buffer = Buffer.alloc(0);
         let firstChunkLogged = false;
+        let firstPayloadLogged = false;
         const targetUrl = ensureAtParam(targetBase, nextAt);
 
         updateConnectionStatus(id, "NDGR ビュー取得中…");
@@ -458,6 +468,10 @@ async function connectNiconico(liveUrlOrId) {
 
         if (!response.ok || !response.body) {
           setStatus(`view/v4 取得失敗 (${response.status})`);
+          if (response.status === 422) {
+            nextAt = "now";
+            continue;
+          }
           break;
         }
 
@@ -493,7 +507,15 @@ async function connectNiconico(liveUrlOrId) {
             }
 
             try {
-              const decoded = decodeChunkedEntry(payload);
+              if (!firstPayloadLogged) {
+                logNico("view payload", {
+                  hex: payload.slice(0, 16).toString("hex"),
+                  length: payload.length,
+                });
+                firstPayloadLogged = true;
+              }
+
+              const decoded = decodeEntryPayload(payload);
               const entries = Array.isArray(decoded?.entry)
                 ? decoded.entry
                 : decoded
