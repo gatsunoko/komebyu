@@ -287,6 +287,8 @@ async function connectNiconico(liveUrlOrId) {
   let watchKeepTimer = null;
   let watchReconnectTimer = null;
   let watchReconnectDelay = 1000;
+  let messageServerViewUri = null;
+  let akashicViewUriIgnored = false;
 
   const cleanupSegments = async () => {
     const pending = Array.from(segmentConnections.values());
@@ -586,18 +588,27 @@ async function connectNiconico(liveUrlOrId) {
       } catch {}
     }
 
-    const candidateUri =
-      parsed?.data?.messageServer?.uri ||
-      parsed?.data?.viewUri ||
-      parsed?.room?.messageServer?.uri ||
-      parsed?.room?.viewUri;
+    if (parsed.type === "messageServer") {
+      const candidateUri =
+        parsed?.data?.viewUri || parsed?.data?.messageServer?.uri;
 
-    if (candidateUri && candidateUri.includes("mpn.live.nicovideo.jp/api/view")) {
-      if (viewUri !== candidateUri) {
-        viewUri = candidateUri;
-        logNico("view uri", viewUri);
-        setStatus(`step3: ndgr viewUri = ${viewUri}`);
-        connectViewStream(viewUri);
+      if (candidateUri && candidateUri.includes("mpn.live.nicovideo.jp/api/view")) {
+        messageServerViewUri = candidateUri;
+        if (viewUri !== candidateUri) {
+          viewUri = candidateUri;
+          logNico("view uri (messageServer)", viewUri);
+          setStatus(`step3: ndgr viewUri = ${viewUri}`);
+          connectViewStream(viewUri);
+        }
+        return;
+      }
+    }
+
+    if (parsed.type === "akashicMessageServer") {
+      const akashicUri = parsed?.data?.viewUri || parsed?.data?.messageServer?.uri;
+      if (akashicUri && !akashicViewUriIgnored) {
+        logNico("akashic viewUri ignored", akashicUri);
+        akashicViewUriIgnored = true;
       }
       return;
     }
@@ -606,7 +617,7 @@ async function connectNiconico(liveUrlOrId) {
     const fallbackView = urlCandidates.find((u) =>
       u.includes("mpn.live.nicovideo.jp/api/view/")
     );
-    if (fallbackView && fallbackView !== viewUri) {
+    if (!messageServerViewUri && fallbackView && fallbackView !== viewUri) {
       viewUri = fallbackView;
       logNico("view uri (fallback)", viewUri);
       setStatus(`step3: ndgr viewUri = ${viewUri}`);
