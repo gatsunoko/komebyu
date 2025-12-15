@@ -598,6 +598,7 @@ async function connectNiconico(liveUrlOrId) {
       messageCount += 1;
       if (messageCount === 1) {
         setStatus("step5: コメント受信開始 (1件目受信)");
+        updateConnectionStatus(id, "接続中 (コメント受信中)");
       }
 
       send("message", {
@@ -625,6 +626,8 @@ async function connectNiconico(liveUrlOrId) {
       const logDecodeError = (err) => {
         logNico("view decode error", err);
       };
+
+      let discoveredSegmentUri = null;
 
       const runView = async () => {
         let buffer = Buffer.alloc(0);
@@ -682,13 +685,11 @@ async function connectNiconico(liveUrlOrId) {
                 const decoded = decodeMessageServerPayload(payload);
                 const segmentUris = extractSegmentUrisFromView(decoded, payload);
                 if (segmentUris.length) {
-                  const nextUri = segmentUris[0];
-                  logNico("segment URIs from view", segmentUris);
-                  if (nextUri && nextUri !== segmentUrl) {
-                    const withAt = ensureAtParam(nextUri, "now");
-                    segmentUrl = withAt;
-                    connectSegmentStream(withAt);
+                  const nextUri = ensureAtParam(segmentUris[0], "now");
+                  if (!discoveredSegmentUri) {
+                    discoveredSegmentUri = nextUri;
                   }
+                  logNico("segment uri =", nextUri);
                 }
               } catch (e) {
                 logDecodeError(e);
@@ -706,6 +707,15 @@ async function connectNiconico(liveUrlOrId) {
 
       viewAbort = null;
       logNico("view/v4 handling finished");
+
+      if (connectionAbortController.signal.aborted) return;
+
+      if (discoveredSegmentUri) {
+        segmentUrl = discoveredSegmentUri;
+        logNico("segment uri =", segmentUrl);
+        setStatus("step4: コメント取得開始");
+        connectSegmentStream(segmentUrl);
+      }
     };
 
     const handleWatchMessage = (raw) => {
