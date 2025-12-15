@@ -13,7 +13,55 @@ window.addEventListener("DOMContentLoaded", () => {
     el.status.textContent = text;
   }
 
-  function appendMessage({ user, text, badges }) {
+  function buildMessageContent(text, emotes) {
+    const fragment = document.createDocumentFragment();
+    const content = String(text ?? "");
+
+    const emoteRanges = [];
+
+    if (emotes && typeof emotes === "object") {
+      for (const [id, ranges] of Object.entries(emotes)) {
+        if (!Array.isArray(ranges)) continue;
+        for (const range of ranges) {
+          const [startStr, endStr] = String(range || "").split("-");
+          const start = Number(startStr);
+          const end = Number(endStr);
+          if (Number.isInteger(start) && Number.isInteger(end) && start <= end) {
+            emoteRanges.push({ start, end, id });
+          }
+        }
+      }
+    }
+
+    emoteRanges.sort((a, b) => a.start - b.start);
+
+    let cursor = 0;
+    const pushText = (value) => {
+      if (value) fragment.append(document.createTextNode(value));
+    };
+
+    for (const { start, end, id } of emoteRanges) {
+      if (cursor < start) pushText(content.slice(cursor, start));
+
+      const emoteText = content.slice(start, end + 1);
+      const img = document.createElement("img");
+      img.className = "emote";
+      img.src = `https://static-cdn.jtvnw.net/emoticons/v2/${id}/default/dark/1.0`;
+      img.alt = emoteText || `:${id}:`;
+      img.loading = "lazy";
+      fragment.appendChild(img);
+
+      cursor = end + 1;
+    }
+
+    if (cursor < content.length) pushText(content.slice(cursor));
+
+    if (!fragment.childNodes.length) pushText(content);
+
+    return fragment;
+  }
+
+  function appendMessage({ user, text, badges, emotes }) {
     const ngWords = (el.ng.value || "")
       .split("\n")
       .map((s) => s.trim())
@@ -30,7 +78,8 @@ window.addEventListener("DOMContentLoaded", () => {
 
     const body = document.createElement("span");
     body.className = "text";
-    body.textContent = `: ${text}`;
+    body.append(": ");
+    body.appendChild(buildMessageContent(text, emotes));
 
     if (badges?.broadcaster) item.classList.add("broadcaster");
     if (badges?.moderator) item.classList.add("moderator");

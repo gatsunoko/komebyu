@@ -228,11 +228,12 @@ async function connectNiconico(liveUrlOrId) {
         const chat = parsed?.chat;
         if (!chat?.content) continue;
 
-        send("message", {
-          user: chat.mail || chat.user_id || "niconico",
-          text: chat.content,
-          badges: {},
-        });
+    send("message", {
+      user: chat.mail || chat.user_id || "niconico",
+      text: chat.content,
+      badges: {},
+      emotes: null,
+    });
       }
     };
 
@@ -325,6 +326,7 @@ async function connectTwitch(channelRaw) {
       user: tags["display-name"] || tags.username || "unknown",
       text: message,
       badges: tags.badges || {},
+      emotes: tags.emotes || null,
     });
   });
 
