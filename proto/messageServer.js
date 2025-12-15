@@ -217,7 +217,26 @@ const decodeChunkedEntry = (buf) => {
   return message;
 };
 
+const decodeEntryPayload = (buf) => {
+  const reader = buf instanceof Reader ? buf : new Reader(buf);
+  if (reader.len === 0) return { entry: [] };
+
+  const firstTag = reader.uint32();
+  reader.pos = 0;
+
+  // field#1 length-delimited => ChunkedEntry, otherwise Entry
+  if ((firstTag >>> 3) === 1 && (firstTag & 7) === 2) {
+    return decodeChunkedEntry(reader);
+  }
+
+  return { entry: [decodeEntry(reader)] };
+};
+
+const decodeEntryBuffer = (buf) => decodeEntry(buf instanceof Reader ? buf : new Reader(buf));
+
 module.exports = {
   decodeChunkedEntry,
+  decodeEntry: decodeEntryBuffer,
+  decodeEntryPayload,
   Reader,
 };
