@@ -1,4 +1,4 @@
-// Decoder for NDGR data/segment/v4 frames (comment stream).
+// Decoder for NDGR segment server (data/segment/v4) chunked messages.
 
 class Reader {
   constructor(buffer) {
@@ -47,6 +47,10 @@ class Reader {
     return Buffer.from(slice).toString("utf8");
   }
 
+  bool() {
+    return this.uint32() !== 0;
+  }
+
   skipType(wireType) {
     switch (wireType) {
       case 0:
@@ -71,13 +75,13 @@ class Reader {
   }
 }
 
-const asNumber = (val) => {
-  if (typeof val === "number") return val;
-  if (typeof val === "bigint") {
-    if (val <= BigInt(Number.MAX_SAFE_INTEGER)) return Number(val);
-    return val;
+const asNumber = (value) => {
+  if (typeof value === "number") return value;
+  if (typeof value === "bigint") {
+    if (value <= BigInt(Number.MAX_SAFE_INTEGER)) return Number(value);
+    return value;
   }
-  return val == null ? null : Number(val);
+  return value == null ? null : Number(value);
 };
 
 const decodeReconnect = (reader, length) => {
@@ -87,13 +91,13 @@ const decodeReconnect = (reader, length) => {
     const tag = reader.uint32();
     switch (tag >>> 3) {
       case 1:
-        message.cursor = String(asNumber(reader.int64()));
+        message.at = asNumber(reader.int64());
         break;
       case 2:
         message.streamUrl = reader.string();
         break;
       case 3:
-        message.at = asNumber(reader.int64());
+        message.cursor = reader.string();
         break;
       default:
         reader.skipType(tag & 7);
@@ -134,7 +138,7 @@ const decodeChat = (reader, length) => {
         message.mail = reader.string();
         break;
       case 9:
-        message.anonymous = reader.uint32() !== 0;
+        message.anonymous = reader.bool();
         break;
       default:
         reader.skipType(tag & 7);
@@ -144,17 +148,17 @@ const decodeChat = (reader, length) => {
   return message;
 };
 
-const decodeError = (reader, length) => {
+const decodeStatistics = (reader, length) => {
   const end = length === undefined ? reader.len : reader.pos + length;
   const message = {};
   while (reader.pos < end) {
     const tag = reader.uint32();
     switch (tag >>> 3) {
       case 1:
-        message.code = reader.string();
+        message.watchCount = asNumber(reader.uint64());
         break;
       case 2:
-        message.message = reader.string();
+        message.commentCount = asNumber(reader.uint64());
         break;
       default:
         reader.skipType(tag & 7);
@@ -164,36 +168,26 @@ const decodeError = (reader, length) => {
   return message;
 };
 
-const decodeSegmentPayload = (buf) => {
-  const reader = buf instanceof Reader ? buf : new Reader(buf);
+const decodeMessage = (reader, length) => {
+  const end = length === undefined ? reader.len : reader.pos + length;
   const message = {};
-  while (reader.pos < reader.len) {
+  while (reader.pos < end) {
     const tag = reader.uint32();
     switch (tag >>> 3) {
       case 1:
-        message.serverTime = { currentMs: asNumber(reader.int64()) };
+        message.chat = decodeChat(reader, reader.uint32());
         break;
       case 2:
         message.reconnect = decodeReconnect(reader, reader.uint32());
         break;
       case 3:
-        message.cursor = String(asNumber(reader.int64()));
+        message.statistics = decodeStatistics(reader, reader.uint32());
         break;
       case 4:
         message.ping = {};
         break;
-      case 7:
-        message.chat = decodeChat(reader, reader.uint32());
-        break;
-      case 8:
-        message.statistics = {};
-        reader.skipType(tag & 7);
-        break;
-      case 9:
-        message.error = decodeError(reader, reader.uint32());
-        break;
-      case 10:
-        message.disconnect = { reason: reader.string() };
+      case 5:
+        message.end = {};
         break;
       default:
         reader.skipType(tag & 7);
@@ -203,4 +197,21 @@ const decodeSegmentPayload = (buf) => {
   return message;
 };
 
-module.exports = { decodeSegmentPayload, Reader };
+const decodeChunkedMessage = (buf) => {
+  const reader = buf instanceof Reader ? buf : new Reader(buf);
+  const message = { message: [] };
+  while (reader.pos < reader.len) {
+    const tag = reader.uint32();
+    switch (tag >>> 3) {
+      case 1:
+        message.message.push(decodeMessage(reader, reader.uint32()));
+        break;
+      default:
+        reader.skipType(tag & 7);
+        break;
+    }
+  }
+  return message;
+};
+
+module.exports = { decodeChunkedMessage, Reader };

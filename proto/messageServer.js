@@ -1,5 +1,6 @@
-// Decoder for NDGR view/v4 message server frames.
-// Only extracts metadata required to locate the segment server URI.
+// Decoder for NDGR message server (view/v4) chunked entries.
+// Implements Dwango.Nicolive.Chat.Service.Edge.ChunkedEntry manually to avoid
+// external runtime dependencies.
 
 class Reader {
   constructor(buffer) {
@@ -48,16 +49,6 @@ class Reader {
     return Buffer.from(slice).toString("utf8");
   }
 
-  bytes() {
-    const length = this.uint32();
-    const start = this.pos;
-    const end = start + length;
-    if (end > this.len) throw new Error("unexpected eof while reading bytes");
-    const slice = this.buf.subarray(start, end);
-    this.pos = end;
-    return slice;
-  }
-
   skipType(wireType) {
     switch (wireType) {
       case 0:
@@ -82,13 +73,76 @@ class Reader {
   }
 }
 
-const asNumber = (val) => {
-  if (typeof val === "number") return val;
-  if (typeof val === "bigint") {
-    if (val <= BigInt(Number.MAX_SAFE_INTEGER)) return Number(val);
-    return val;
+const asNumber = (value) => {
+  if (typeof value === "number") return value;
+  if (typeof value === "bigint") {
+    if (value <= BigInt(Number.MAX_SAFE_INTEGER)) return Number(value);
+    return value;
   }
-  return val == null ? null : Number(val);
+  return value == null ? null : Number(value);
+};
+
+const decodeSegment = (reader, length) => {
+  const end = length === undefined ? reader.len : reader.pos + length;
+  const message = {};
+  while (reader.pos < end) {
+    const tag = reader.uint32();
+    switch (tag >>> 3) {
+      case 1:
+        message.uri = reader.string();
+        break;
+      case 2:
+        message.from = asNumber(reader.int64());
+        break;
+      case 3:
+        message.until = asNumber(reader.int64());
+        break;
+      default:
+        reader.skipType(tag & 7);
+        break;
+    }
+  }
+  return message;
+};
+
+const decodeNext = (reader, length) => {
+  const end = length === undefined ? reader.len : reader.pos + length;
+  const message = {};
+  while (reader.pos < end) {
+    const tag = reader.uint32();
+    switch (tag >>> 3) {
+      case 1:
+        message.at = asNumber(reader.int64());
+        break;
+      case 2:
+        message.cursor = reader.string();
+        break;
+      default:
+        reader.skipType(tag & 7);
+        break;
+    }
+  }
+  return message;
+};
+
+const decodePrevious = (reader, length) => {
+  const end = length === undefined ? reader.len : reader.pos + length;
+  const message = {};
+  while (reader.pos < end) {
+    const tag = reader.uint32();
+    switch (tag >>> 3) {
+      case 1:
+        message.at = asNumber(reader.int64());
+        break;
+      case 2:
+        message.cursor = reader.string();
+        break;
+      default:
+        reader.skipType(tag & 7);
+        break;
+    }
+  }
+  return message;
 };
 
 const decodeReconnect = (reader, length) => {
@@ -103,6 +157,9 @@ const decodeReconnect = (reader, length) => {
       case 2:
         message.streamUrl = reader.string();
         break;
+      case 3:
+        message.cursor = reader.string();
+        break;
       default:
         reader.skipType(tag & 7);
         break;
@@ -111,29 +168,29 @@ const decodeReconnect = (reader, length) => {
   return message;
 };
 
-const decodeRoom = (reader, length) => {
+const decodeEntry = (reader, length) => {
   const end = length === undefined ? reader.len : reader.pos + length;
   const message = {};
   while (reader.pos < end) {
     const tag = reader.uint32();
     switch (tag >>> 3) {
       case 1:
-        message.name = reader.string();
+        message.segment = decodeSegment(reader, reader.uint32());
         break;
       case 2:
-        message.messageServerUrl = reader.string();
+        message.next = decodeNext(reader, reader.uint32());
         break;
       case 3:
-        message.threadId = reader.string();
+        message.previous = decodePrevious(reader, reader.uint32());
         break;
       case 4:
-        message.messageServer = decodeRoom(reader, reader.uint32());
+        message.reconnect = decodeReconnect(reader, reader.uint32());
         break;
       case 5:
-        message.url = reader.string();
+        message.ping = {};
         break;
       case 6:
-        message.viewUri = reader.string();
+        message.history = {};
         break;
       default:
         reader.skipType(tag & 7);
@@ -143,52 +200,14 @@ const decodeRoom = (reader, length) => {
   return message;
 };
 
-const decodeError = (reader, length) => {
-  const end = length === undefined ? reader.len : reader.pos + length;
-  const message = {};
-  while (reader.pos < end) {
-    const tag = reader.uint32();
-    switch (tag >>> 3) {
-      case 1:
-        message.code = reader.string();
-        break;
-      case 2:
-        message.message = reader.string();
-        break;
-      default:
-        reader.skipType(tag & 7);
-        break;
-    }
-  }
-  return message;
-};
-
-const decodeMessageServerPayload = (buf) => {
+const decodeChunkedEntry = (buf) => {
   const reader = buf instanceof Reader ? buf : new Reader(buf);
-  const message = {};
+  const message = { entry: [] };
   while (reader.pos < reader.len) {
     const tag = reader.uint32();
     switch (tag >>> 3) {
       case 1:
-        message.serverTime = { currentMs: asNumber(reader.int64()) };
-        break;
-      case 2:
-        message.room = decodeRoom(reader, reader.uint32());
-        break;
-      case 3:
-        message.seat = { id: String(asNumber(reader.int64())) };
-        break;
-      case 4:
-        message.ping = {};
-        break;
-      case 5:
-        message.disconnect = { reason: reader.string() };
-        break;
-      case 6:
-        message.reconnect = decodeReconnect(reader, reader.uint32());
-        break;
-      case 9:
-        message.error = decodeError(reader, reader.uint32());
+        message.entry.push(decodeEntry(reader, reader.uint32()));
         break;
       default:
         reader.skipType(tag & 7);
@@ -198,47 +217,7 @@ const decodeMessageServerPayload = (buf) => {
   return message;
 };
 
-const collectSegmentUrisFromText = (text) => {
-  const uris = [];
-  if (!text) return uris;
-  const regex = /https?:\/\/mpn\.live\.nicovideo\.jp\/data\/segment\/v4\/[^\s"']+/g;
-  let m;
-  while ((m = regex.exec(text))) {
-    if (!uris.includes(m[0])) uris.push(m[0]);
-  }
-  return uris;
-};
-
-const extractSegmentUrisFromView = (decoded, rawBuffer) => {
-  const uris = [];
-  const collectStrings = (value) => {
-    if (!value) return;
-    if (typeof value === "string") {
-      uris.push(...collectSegmentUrisFromText(value));
-      return;
-    }
-    if (Array.isArray(value)) {
-      value.forEach(collectStrings);
-      return;
-    }
-    if (typeof value === "object") {
-      Object.values(value).forEach(collectStrings);
-    }
-  };
-
-  collectStrings(decoded);
-
-  if (!uris.length && rawBuffer) {
-    try {
-      uris.push(...collectSegmentUrisFromText(Buffer.from(rawBuffer).toString("utf8")));
-    } catch {}
-  }
-
-  return Array.from(new Set(uris));
-};
-
 module.exports = {
-  decodeMessageServerPayload,
-  extractSegmentUrisFromView,
+  decodeChunkedEntry,
   Reader,
 };

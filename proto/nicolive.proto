@@ -1,0 +1,76 @@
+syntax = "proto3";
+
+package dwango.nicolive.chat.service.edge;
+
+message ChunkedEntry {
+  repeated Entry entry = 1;
+}
+
+message Entry {
+  oneof payload {
+    Segment segment = 1;
+    Next next = 2;
+    Previous previous = 3;
+    Reconnect reconnect = 4;
+    Ping ping = 5;
+    History history = 6;
+  }
+}
+
+message Segment {
+  string uri = 1;
+  int64 from = 2;
+  int64 until = 3;
+}
+
+message Next {
+  int64 at = 1;
+  string cursor = 2;
+}
+
+message Previous {
+  int64 at = 1;
+  string cursor = 2;
+}
+
+message Reconnect {
+  int64 at = 1;
+  string streamUrl = 2;
+  string cursor = 3;
+}
+
+message Ping {}
+message History {}
+
+message ChunkedMessage {
+  repeated Message message = 1;
+}
+
+message Message {
+  oneof payload {
+    Chat chat = 1;
+    Reconnect reconnect = 2;
+    Statistics statistics = 3;
+    Ping ping = 4;
+    End end = 5;
+  }
+}
+
+message Chat {
+  string roomName = 1;
+  string threadId = 2;
+  int64 no = 3;
+  int64 vpos = 4;
+  string content = 5;
+  string userId = 6;
+  string name = 7;
+  string mail = 8;
+  bool anonymous = 9;
+}
+
+message Statistics {
+  uint64 watchCount = 1;
+  uint64 commentCount = 2;
+}
+
+message End {}
