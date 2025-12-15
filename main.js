@@ -373,7 +373,7 @@ async function connectNiconico(liveUrlOrId) {
 
     logNico("step2: watch websocket url search");
 
-    const findProps = () => {
+      const findProps = () => {
       const embeddedMatch = html.match(
         /<script[^>]*id="embedded-data"[^>]*data-props="([^"]+)"/i
       );
