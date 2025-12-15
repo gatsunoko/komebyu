@@ -2,7 +2,7 @@ const { app, BrowserWindow, ipcMain } = require("electron");
 const path = require("path");
 const tmi = require("tmi.js");
 const WebSocket = require("ws");
-const { decodeEntryPayload } = require("./proto/messageServer");
+const { decodeEntry, decodeEntryPayload } = require("./proto/messageServer");
 const { decodeChunkedMessage } = require("./proto/segmentServer");
 
 const NICO_DEBUG = process.env.NICO_DEBUG !== "false";
@@ -91,6 +91,62 @@ function readVarint(buf, offset = 0) {
     shift += 7n;
   }
   return null;
+}
+
+function normalizeAt(at) {
+  if (at == null) return null;
+  if (at === "now") return "now";
+  try {
+    const value = BigInt(at);
+    const abs = value < 0n ? -value : value;
+    let normalized = abs;
+    if (abs < 1_000_000_000_000n) {
+      normalized = abs * 1000n;
+    }
+    const asNumber =
+      normalized <= BigInt(Number.MAX_SAFE_INTEGER)
+        ? Number(normalized)
+        : normalized;
+    if (typeof asNumber === "number") {
+      logNico(
+        "normalizeAt",
+        `${at} -> ${normalized.toString()} (${new Date(asNumber).toISOString()})`
+      );
+    } else {
+      logNico("normalizeAt", `${at} -> ${normalized.toString()}`);
+    }
+    return normalized.toString();
+  } catch {
+    return String(at);
+  }
+}
+
+function createChunkProcessor(label, onPayload) {
+  let buffer = Buffer.alloc(0);
+
+  return (value) => {
+    if (value && value.length) buffer = Buffer.concat([buffer, Buffer.from(value)]);
+
+    while (buffer.length) {
+      const lengthInfo = readVarint(buffer, 0);
+      if (!lengthInfo) break;
+      const payloadLength = Number(lengthInfo.value);
+      const varintLength = lengthInfo.length;
+      const totalLength = varintLength + payloadLength;
+      if (buffer.length < totalLength) break;
+
+      if (payloadLength < 1) {
+        buffer = buffer.slice(totalLength);
+        continue;
+      }
+
+      const payload = buffer.slice(varintLength, totalLength);
+      const rawChunk = buffer.slice(0, totalLength);
+      buffer = buffer.slice(totalLength);
+
+      onPayload({ payload, rawChunk, payloadLength, varintLength });
+    }
+  };
 }
 
 let win = null;
@@ -343,7 +399,6 @@ async function connectNiconico(liveUrlOrId) {
     segmentConnections.set(uri, state);
 
     state.promise = (async () => {
-      let buffer = Buffer.alloc(0);
       let firstMessageLogged = false;
       let firstPayloadLogged = false;
 
@@ -365,72 +420,68 @@ async function connectNiconico(liveUrlOrId) {
         }
 
         const reader = response.body.getReader();
+        const processChunk = createChunkProcessor("segment", ({
+          payload,
+          payloadLength,
+          varintLength,
+        }) => {
+          try {
+            if (!firstPayloadLogged) {
+              logNico("segment payload", {
+                hex: payload.slice(0, 16).toString("hex"),
+                length: payload.length,
+              });
+              firstPayloadLogged = true;
+            }
+
+            const decoded = decodeChunkedMessage(payload);
+            const envelopes = Array.isArray(decoded?.messages)
+              ? decoded.messages
+              : decoded
+                ? [decoded]
+                : [];
+
+            for (const msg of envelopes) {
+              if (msg?.chat?.content && !firstMessageLogged) {
+                logNico("first segment chat", msg.chat.content);
+                firstMessageLogged = true;
+                setStatus("step5: コメント受信開始 (1件目受信)");
+                updateConnectionStatus(id, "接続中 (コメント受信中)");
+              }
+
+              if (msg?.chat?.content) {
+                messageCount += 1;
+                send("message", {
+                  connectionId: id,
+                  source: connection.label,
+                  user: msg.chat.name || msg.chat.userId || "niconico",
+                  text: msg.chat.content,
+                  badges: {},
+                  emotes: null,
+                });
+              }
+
+              if (msg?.reconnect?.streamUrl) {
+                const normalizedAt = normalizeAt(msg.reconnect.at) || "now";
+                const nextUri = ensureAtParam(msg.reconnect.streamUrl, normalizedAt);
+                startSegmentStream(nextUri);
+              }
+            }
+          } catch (err) {
+            logNico("segment decode error", {
+              error: err,
+              varint: payloadLength,
+              varintLength,
+              payloadHex: payload.slice(0, 16).toString("hex"),
+            });
+          }
+        });
+
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
-          if (value && value.length) buffer = Buffer.concat([buffer, Buffer.from(value)]);
-
-          while (buffer.length) {
-            const lengthInfo = readVarint(buffer, 0);
-            if (!lengthInfo) break;
-            const messageLength = Number(lengthInfo.value);
-            const offset = lengthInfo.length;
-            const chunkEnd = offset + messageLength;
-            if (buffer.length < chunkEnd) break;
-            if (messageLength < 1) {
-              buffer = buffer.slice(offset);
-              continue;
-            }
-
-            const payload = buffer.slice(offset, chunkEnd);
-            buffer = buffer.slice(chunkEnd);
-
-            try {
-              if (!firstPayloadLogged) {
-                logNico("segment payload", {
-                  hex: payload.slice(0, 16).toString("hex"),
-                  length: payload.length,
-                });
-                firstPayloadLogged = true;
-              }
-
-              const decoded = decodeChunkedMessage(payload);
-              const envelopes = Array.isArray(decoded?.message)
-                ? decoded.message
-                : decoded
-                  ? [decoded]
-                  : [];
-
-              for (const msg of envelopes) {
-                if (msg?.chat?.content && !firstMessageLogged) {
-                  logNico("first segment chat", msg.chat.content);
-                  firstMessageLogged = true;
-                  setStatus("step5: コメント受信開始 (1件目受信)");
-                  updateConnectionStatus(id, "接続中 (コメント受信中)");
-                }
-
-                if (msg?.chat?.content) {
-                  messageCount += 1;
-                  send("message", {
-                    connectionId: id,
-                    source: connection.label,
-                    user: msg.chat.name || msg.chat.userId || "niconico",
-                    text: msg.chat.content,
-                    badges: {},
-                    emotes: null,
-                  });
-                }
-
-                if (msg?.reconnect?.streamUrl) {
-                  const at = msg.reconnect.at ?? "now";
-                  const nextUri = ensureAtParam(msg.reconnect.streamUrl, at);
-                  startSegmentStream(nextUri);
-                }
-              }
-            } catch (err) {
-              logNico("segment decode error", err);
-            }
-          }
+          if (!value) continue;
+          processChunk(value);
         }
       } catch (e) {
         if (!controller.signal.aborted) {
@@ -442,21 +493,22 @@ async function connectNiconico(liveUrlOrId) {
     })();
   };
 
-  const connectViewStream = async (targetBase) => {
-    let nextAt = "now";
+  const connectViewStream = async (initialBase) => {
+    let targetBase = initialBase;
+    let nextStreamAt = "now";
+    let reconnectDelay = 1000;
 
     while (!connectionAbortController.signal.aborted && targetBase) {
       if (viewAbort) viewAbort.abort();
       viewAbort = new AbortController();
       const localAbort = viewAbort;
-      let reconnectAt = null;
+      let updatedDuringStream = false;
+      const atValue = normalizeAt(nextStreamAt) || "now";
+      const targetUrl = ensureAtParam(targetBase, atValue);
+      let firstChunkLogged = false;
+      let firstPayloadLogged = false;
 
       try {
-        let buffer = Buffer.alloc(0);
-        let firstChunkLogged = false;
-        let firstPayloadLogged = false;
-        const targetUrl = ensureAtParam(targetBase, nextAt);
-
         updateConnectionStatus(id, "NDGR ビュー取得中…");
         setStatus(`step3: view/v4 接続 ${targetUrl}`);
 
@@ -465,93 +517,112 @@ async function connectNiconico(liveUrlOrId) {
           headers: {
             "User-Agent": "komebyu/1.0 (+https://github.com/)",
             Accept: "application/octet-stream",
+            header: "u=1, i",
+            Origin: "https://live.nicovideo.jp",
+            Referer: "https://live.nicovideo.jp/",
           },
         });
 
         if (!response.ok || !response.body) {
           setStatus(`view/v4 取得失敗 (${response.status})`);
           if (response.status === 422) {
-            nextAt = "now";
+            nextStreamAt = "now";
             continue;
           }
           break;
         }
 
         const reader = response.body.getReader();
+        const processChunk = createChunkProcessor("view", ({
+          payload,
+          rawChunk,
+          payloadLength,
+          varintLength,
+        }) => {
+          if (!firstChunkLogged) {
+            logNico("view chunk0", {
+              hex: rawChunk.toString("hex"),
+              length: rawChunk.length,
+            });
+            firstChunkLogged = true;
+          }
+
+          try {
+            if (!firstPayloadLogged) {
+              logNico("view payload", {
+                hex: payload.slice(0, 16).toString("hex"),
+                length: payload.length,
+              });
+              firstPayloadLogged = true;
+            }
+
+            const decoded = decodeEntryPayload(payload);
+            let entries = Array.isArray(decoded?.entries) ? decoded.entries : [];
+
+            if (!entries.length) {
+              try {
+                const fallback = decodeEntry(payload);
+                if (fallback) entries = [fallback];
+              } catch (fallbackErr) {
+                logNico("view decode fallback failed", fallbackErr);
+              }
+            }
+
+            for (const entry of entries) {
+              if (entry?.segment?.uri) {
+                const nextUri = ensureAtParam(entry.segment.uri, "now");
+                logNico("segment uri (view)", nextUri);
+                startSegmentStream(nextUri);
+              }
+
+              if (entry?.reconnect?.at != null) {
+                const normalized = normalizeAt(entry.reconnect.at) || atValue;
+                nextStreamAt = normalized;
+                updatedDuringStream = true;
+                logNico("view reconnect.at", normalized);
+                try {
+                  localAbort.abort();
+                } catch {}
+                break;
+              }
+
+              if (entry?.next?.at != null) {
+                const normalized = normalizeAt(entry.next.at) || atValue;
+                nextStreamAt = normalized;
+                updatedDuringStream = true;
+                if (entry.next.uri) {
+                  targetBase = entry.next.uri;
+                  viewUri = entry.next.uri;
+                  logNico("view next.uri", targetBase);
+                }
+                logNico("view next.at", normalized);
+                try {
+                  localAbort.abort();
+                } catch {}
+                break;
+              }
+
+              if (entry?.reconnect?.streamUrl) {
+                const at = normalizeAt(entry.reconnect.at) || "now";
+                startSegmentStream(ensureAtParam(entry.reconnect.streamUrl, at));
+              }
+            }
+          } catch (e) {
+            logNico("view decode error", {
+              error: e,
+              varint: payloadLength,
+              varintLength,
+              payloadHex: payload.slice(0, 32).toString("hex"),
+              chunkHead: rawChunk.slice(0, 16).toString("hex"),
+            });
+          }
+        });
+
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
           if (!value) continue;
-          buffer = Buffer.concat([buffer, Buffer.from(value)]);
-
-          while (buffer.length) {
-            const lengthInfo = readVarint(buffer, 0);
-            if (!lengthInfo) break;
-            const messageLength = Number(lengthInfo.value);
-            const offset = lengthInfo.length;
-            const chunkEnd = offset + messageLength;
-            if (buffer.length < chunkEnd) break;
-            if (messageLength < 1) {
-              buffer = buffer.slice(offset);
-              continue;
-            }
-
-            const payload = buffer.slice(offset, chunkEnd);
-            const rawChunk = buffer.slice(0, chunkEnd);
-            buffer = buffer.slice(chunkEnd);
-
-            if (!firstChunkLogged) {
-              logNico("view chunk0", {
-                hex: rawChunk.toString("hex"),
-                length: rawChunk.length,
-              });
-              firstChunkLogged = true;
-            }
-
-            try {
-              if (!firstPayloadLogged) {
-                logNico("view payload", {
-                  hex: payload.slice(0, 16).toString("hex"),
-                  length: payload.length,
-                });
-                firstPayloadLogged = true;
-              }
-
-              const decoded = decodeEntryPayload(payload);
-              const entries = Array.isArray(decoded?.entry)
-                ? decoded.entry
-                : decoded
-                  ? [decoded]
-                  : [];
-
-              for (const entry of entries) {
-                if (entry?.segment?.uri) {
-                  const nextUri = ensureAtParam(entry.segment.uri, "now");
-                  logNico("segment uri (view)", nextUri);
-                  startSegmentStream(nextUri);
-                }
-
-                if (entry?.next?.at != null) {
-                  reconnectAt = entry.next.at;
-                  try {
-                    localAbort.abort();
-                  } catch {}
-                  break;
-                }
-
-                if (entry?.reconnect?.streamUrl) {
-                  const at = entry.reconnect.at ?? "now";
-                  startSegmentStream(ensureAtParam(entry.reconnect.streamUrl, at));
-                }
-              }
-            } catch (e) {
-              logNico("view decode error", {
-                error: e,
-                payloadHex: payload.slice(0, 32).toString("hex"),
-                payloadLength: payload.length,
-              });
-            }
-          }
+          processChunk(value);
         }
       } catch (e) {
         if (!localAbort.signal.aborted) {
@@ -560,8 +631,14 @@ async function connectNiconico(liveUrlOrId) {
       }
 
       viewAbort = null;
-      if (reconnectAt == null) break;
-      nextAt = reconnectAt;
+      if (connectionAbortController.signal.aborted) break;
+
+      if (!updatedDuringStream && atValue === nextStreamAt) {
+        await new Promise((resolve) => setTimeout(resolve, reconnectDelay));
+        reconnectDelay = Math.min(reconnectDelay * 2, 16000);
+      } else {
+        reconnectDelay = 1000;
+      }
     }
   };
 

@@ -202,12 +202,12 @@ const decodeEntry = (reader, length) => {
 
 const decodeChunkedEntry = (buf) => {
   const reader = buf instanceof Reader ? buf : new Reader(buf);
-  const message = { entry: [] };
+  const message = { entries: [] };
   while (reader.pos < reader.len) {
     const tag = reader.uint32();
     switch (tag >>> 3) {
       case 1:
-        message.entry.push(decodeEntry(reader, reader.uint32()));
+        message.entries.push(decodeEntry(reader, reader.uint32()));
         break;
       default:
         reader.skipType(tag & 7);
@@ -219,7 +219,7 @@ const decodeChunkedEntry = (buf) => {
 
 const decodeEntryPayload = (buf) => {
   const reader = buf instanceof Reader ? buf : new Reader(buf);
-  if (reader.len === 0) return { entry: [] };
+  if (reader.len === 0) return { entries: [] };
 
   const firstTag = reader.uint32();
   reader.pos = 0;
@@ -229,7 +229,7 @@ const decodeEntryPayload = (buf) => {
     return decodeChunkedEntry(reader);
   }
 
-  return { entry: [decodeEntry(reader)] };
+  return { entries: [decodeEntry(reader)] };
 };
 
 const decodeEntryBuffer = (buf) => decodeEntry(buf instanceof Reader ? buf : new Reader(buf));
