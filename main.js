@@ -3,11 +3,7 @@ const path = require("path");
 const tmi = require("tmi.js");
 
 let win = null;
-let client = null;
-let currentChannel = null;
-let nicoWatchSocket = null;
-let nicoCommentSocket = null;
-let nicoKeepSeatTimer = null;
+const connections = new Map();
 
 function send(type, payload) {
   if (win && !win.isDestroyed()) {
@@ -16,40 +12,48 @@ function send(type, payload) {
 }
 
 function setStatus(text) {
-  send("status", text);
+  send("status", { global: text });
   console.log("[status]", text);
 }
 
-async function disconnectTwitch() {
-  if (!client) {
-    setStatus("未接続");
-    return;
-  }
-  try {
-    await client.disconnect();
-  } catch {}
-  client = null;
-  currentChannel = null;
-  setStatus("未接続");
+function broadcastConnections() {
+  send(
+    "connections",
+    Array.from(connections.values()).map(({ id, label, type, status }) => ({
+      id,
+      label,
+      type,
+      status,
+    }))
+  );
 }
 
-async function disconnectNiconico() {
-  if (nicoWatchSocket) {
+async function disconnectConnection(id) {
+  const conn = connections.get(id);
+  if (!conn) return;
+
+  if (typeof conn.disconnect === "function") {
     try {
-      nicoWatchSocket.close();
+      await conn.disconnect();
     } catch {}
   }
-  if (nicoCommentSocket) {
-    try {
-      nicoCommentSocket.close();
-    } catch {}
+
+  connections.delete(id);
+  broadcastConnections();
+}
+
+async function disconnectAll() {
+  const ids = Array.from(connections.keys());
+  for (const id of ids) {
+    await disconnectConnection(id);
   }
-  if (nicoKeepSeatTimer) {
-    clearInterval(nicoKeepSeatTimer);
-    nicoKeepSeatTimer = null;
-  }
-  nicoWatchSocket = null;
-  nicoCommentSocket = null;
+}
+
+function updateConnectionStatus(id, status) {
+  const conn = connections.get(id);
+  if (!conn) return;
+  conn.status = status;
+  broadcastConnections();
 }
 
 function parseNiconicoId(raw) {
@@ -75,10 +79,22 @@ async function connectNiconico(liveUrlOrId) {
     return;
   }
 
-  await disconnectTwitch();
-  await disconnectNiconico();
+  const id = `niconico:${liveId}`;
+  if (connections.has(id)) {
+    setStatus(`${liveId} は既に接続中です`);
+    return;
+  }
 
-  setStatus(`ニコ生に接続中… ${liveId}`);
+  const connection = {
+    id,
+    type: "niconico",
+    label: `ニコ生 ${liveId}`,
+    status: "ニコ生に接続中…",
+    disconnect: null,
+  };
+
+  connections.set(id, connection);
+  broadcastConnections();
 
   const watchUrl = `https://live.nicovideo.jp/watch/${liveId}`;
 
@@ -92,18 +108,21 @@ async function connectNiconico(liveUrlOrId) {
 
     if (!res.ok) {
       setStatus(`ニコ生取得失敗 (${res.status})`);
+      await disconnectConnection(id);
       return;
     }
 
     html = await res.text();
   } catch (e) {
     setStatus(`ニコ生取得失敗: ${e?.message || String(e)}`);
+    await disconnectConnection(id);
     return;
   }
 
   const propsMatch = html.match(/data-props="([^"]+)"/);
   if (!propsMatch) {
     setStatus("ニコ生の情報が読み取れませんでした (data-props)");
+    await disconnectConnection(id);
     return;
   }
 
@@ -115,6 +134,7 @@ async function connectNiconico(liveUrlOrId) {
     props = JSON.parse(jsonText);
   } catch (e) {
     setStatus(`ニコ生の情報パース失敗: ${e?.message || String(e)}`);
+    await disconnectConnection(id);
     return;
   }
 
@@ -123,23 +143,52 @@ async function connectNiconico(liveUrlOrId) {
 
   if (!webSocketUrl) {
     setStatus("ニコ生のwebSocketUrlが見つかりませんでした");
+    await disconnectConnection(id);
     return;
   }
 
   const userId = props?.user?.id || "0";
 
+  let watchSocket = null;
+  let commentSocket = null;
+  let keepSeatTimer = null;
+
+  const cleanup = () => {
+    if (watchSocket) {
+      try {
+        watchSocket.close();
+      } catch {}
+    }
+    if (commentSocket) {
+      try {
+        commentSocket.close();
+      } catch {}
+    }
+    if (keepSeatTimer) {
+      clearInterval(keepSeatTimer);
+      keepSeatTimer = null;
+    }
+    watchSocket = null;
+    commentSocket = null;
+  };
+
+  connection.disconnect = async () => {
+    cleanup();
+  };
+
   try {
-    nicoWatchSocket = new WebSocket(webSocketUrl);
+    watchSocket = new WebSocket(webSocketUrl);
   } catch (e) {
     setStatus(`ニコ生への接続開始失敗: ${e?.message || String(e)}`);
+    await disconnectConnection(id);
     return;
   }
 
-  setStatus("ニコ生: セッション開始中…");
+  updateConnectionStatus(id, "ニコ生: セッション開始中…");
 
-  nicoWatchSocket.onopen = () => {
+  watchSocket.onopen = () => {
     try {
-      nicoWatchSocket.send(
+      watchSocket.send(
         JSON.stringify({
           type: "startWatching",
           data: {
@@ -157,9 +206,9 @@ async function connectNiconico(liveUrlOrId) {
           },
         })
       );
-      nicoKeepSeatTimer = setInterval(() => {
+      keepSeatTimer = setInterval(() => {
         try {
-          nicoWatchSocket?.send?.(
+          watchSocket?.send?.(
             JSON.stringify({
               type: "keepSeat",
             })
@@ -178,10 +227,7 @@ async function connectNiconico(liveUrlOrId) {
     }
 
     try {
-      nicoCommentSocket = new WebSocket(
-        messageServer.uri,
-        "msg.nicovideo.jp#json"
-      );
+      commentSocket = new WebSocket(messageServer.uri, "msg.nicovideo.jp#json");
     } catch (e) {
       setStatus(`ニコ生: コメント接続失敗 ${e?.message || String(e)}`);
       return;
@@ -189,8 +235,8 @@ async function connectNiconico(liveUrlOrId) {
 
     const threadId = String(messageServer.threadId);
 
-    nicoCommentSocket.onopen = () => {
-      setStatus(`ニコ生: コメント接続完了 (${threadId})`);
+    commentSocket.onopen = () => {
+      updateConnectionStatus(id, `コメント接続完了 (${threadId})`);
       const payloads = [
         { ping: { content: "rs:0" } },
         {
@@ -207,12 +253,12 @@ async function connectNiconico(liveUrlOrId) {
       ];
       for (const p of payloads) {
         try {
-          nicoCommentSocket.send(JSON.stringify(p));
+          commentSocket.send(JSON.stringify(p));
         } catch {}
       }
     };
 
-    nicoCommentSocket.onmessage = (event) => {
+    commentSocket.onmessage = (event) => {
       const lines = String(event.data || "")
         .split("\n")
         .map((s) => s.trim())
@@ -231,25 +277,28 @@ async function connectNiconico(liveUrlOrId) {
         const chat = parsed?.chat;
         if (!chat?.content) continue;
 
-    send("message", {
-      user: chat.mail || chat.user_id || "niconico",
-      text: chat.content,
-      badges: {},
-      emotes: null,
-    });
+        send("message", {
+          connectionId: id,
+          source: connection.label,
+          user: chat.mail || chat.user_id || "niconico",
+          text: chat.content,
+          badges: {},
+          emotes: null,
+        });
       }
     };
 
-    nicoCommentSocket.onerror = (e) => {
+    commentSocket.onerror = (e) => {
       setStatus(`ニコ生コメントエラー: ${e?.message || String(e)}`);
     };
 
-    nicoCommentSocket.onclose = () => {
-      setStatus("ニコ生コメント切断");
+    commentSocket.onclose = () => {
+      updateConnectionStatus(id, "コメント切断");
+      disconnectConnection(id);
     };
   }
 
-  nicoWatchSocket.onmessage = (event) => {
+  watchSocket.onmessage = (event) => {
     let data;
     try {
       data = JSON.parse(event.data);
@@ -259,18 +308,19 @@ async function connectNiconico(liveUrlOrId) {
 
     if (data.type === "ping") {
       try {
-        nicoWatchSocket.send(JSON.stringify({ type: "pong" }));
+        watchSocket.send(JSON.stringify({ type: "pong" }));
       } catch {}
       return;
     }
 
     if (data.type === "seat") {
-      setStatus("ニコ生: 座席確保");
+      updateConnectionStatus(id, "座席確保");
       return;
     }
 
     if (data.type === "error") {
       setStatus(`ニコ生エラー: ${data?.data?.code || "unknown"}`);
+      disconnectConnection(id);
       return;
     }
 
@@ -282,17 +332,19 @@ async function connectNiconico(liveUrlOrId) {
     }
 
     if (data.type === "disconnect") {
-      setStatus("ニコ生切断");
+      updateConnectionStatus(id, "切断");
+      disconnectConnection(id);
       return;
     }
   };
 
-  nicoWatchSocket.onerror = (e) => {
+  watchSocket.onerror = (e) => {
     setStatus(`ニコ生エラー: ${e?.message || String(e)}`);
   };
 
-  nicoWatchSocket.onclose = () => {
-    setStatus("ニコ生切断");
+  watchSocket.onclose = () => {
+    updateConnectionStatus(id, "切断");
+    disconnectConnection(id);
   };
 }
 
@@ -303,31 +355,56 @@ async function connectTwitch(channelRaw) {
     return;
   }
 
-  await disconnectTwitch();
-  await disconnectNiconico();
+  const id = `twitch:${channel}`;
+  if (connections.has(id)) {
+    setStatus(`#${channel} は既に接続中です`);
+    return;
+  }
 
-  setStatus(`接続中… #${channel}`);
+  const connection = {
+    id,
+    type: "twitch",
+    label: `Twitch #${channel}`,
+    status: "接続中…",
+    disconnect: null,
+  };
 
-  currentChannel = channel;
-  client = new tmi.Client({
-    options: { debug: true }, // ← 何か起きた時にログが出る
+  connections.set(id, connection);
+  broadcastConnections();
+
+  const client = new tmi.Client({
+    options: { debug: true },
     connection: { reconnect: true, secure: true },
     channels: [channel],
   });
 
-  client.on("connected", (_addr, _port) => setStatus(`接続中: #${channel}`));
-  client.on("reconnect", () => setStatus("再接続中…"));
-  client.on("reconnect_failed", () => setStatus("再接続失敗"));
-  client.on("disconnected", (reason) => setStatus(`切断: ${reason || "unknown"}`));
+  connection.disconnect = async () => {
+    try {
+      await client.disconnect();
+    } catch {}
+  };
+
+  client.on("connected", (_addr, _port) =>
+    updateConnectionStatus(id, `接続中: #${channel}`)
+  );
+  client.on("reconnect", () => updateConnectionStatus(id, "再接続中…"));
+  client.on("reconnect_failed", () =>
+    updateConnectionStatus(id, "再接続失敗")
+  );
+  client.on("disconnected", (reason) => {
+    updateConnectionStatus(id, `切断: ${reason || "unknown"}`);
+    disconnectConnection(id);
+  });
 
   client.on("notice", (_chan, msgid, message) => {
-    // BAN/サスペンド/参加不可などはここに出ます
-    setStatus(`NOTICE: ${msgid} ${message}`);
+    setStatus(`[${channel}] NOTICE: ${msgid} ${message}`);
   });
 
   client.on("message", (_channel, tags, message, self) => {
     if (self) return;
     send("message", {
+      connectionId: id,
+      source: connection.label,
       user: tags["display-name"] || tags.username || "unknown",
       text: message,
       badges: tags.badges || {},
@@ -342,9 +419,8 @@ async function connectTwitch(channelRaw) {
   try {
     await client.connect();
   } catch (e) {
-    setStatus(`接続失敗 catch: ${e?.message || String(e)}`);
-    client = null;
-    currentChannel = null;
+    setStatus(`接続失敗: ${e?.message || String(e)}`);
+    await disconnectConnection(id);
   }
 }
 
@@ -381,7 +457,7 @@ app.whenReady().then(() => {
 });
 
 app.on("window-all-closed", async () => {
-  await disconnectTwitch();
+  await disconnectAll();
   if (process.platform !== "darwin") app.quit();
 });
 
@@ -389,7 +465,10 @@ ipcMain.handle("twitch:connect", async (_e, channel) => {
   await connectAuto(channel);
 });
 
-ipcMain.handle("twitch:disconnect", async () => {
-  await disconnectTwitch();
-  await disconnectNiconico();
+ipcMain.handle("twitch:disconnect", async (_e, targetId) => {
+  if (targetId) {
+    await disconnectConnection(targetId);
+  } else {
+    await disconnectAll();
+  }
 });
