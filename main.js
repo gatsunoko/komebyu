@@ -178,7 +178,10 @@ async function connectNiconico(liveUrlOrId) {
     }
 
     try {
-      nicoCommentSocket = new WebSocket(messageServer.uri);
+      nicoCommentSocket = new WebSocket(
+        messageServer.uri,
+        "msg.nicovideo.jp#json"
+      );
     } catch (e) {
       setStatus(`ニコ生: コメント接続失敗 ${e?.message || String(e)}`);
       return;
@@ -272,7 +275,9 @@ async function connectNiconico(liveUrlOrId) {
     }
 
     if (data.type === "room") {
-      startCommentSocket(data.data?.messageServer || data.data);
+      const messageServer = data.data?.messageServer || data.data;
+      const threadId = data.data?.threadId;
+      startCommentSocket({ ...messageServer, threadId });
       return;
     }
 
