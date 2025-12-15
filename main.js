@@ -49,6 +49,24 @@ async function disconnectAll() {
   }
 }
 
+function parseTwitchChannel(raw) {
+  const trimmed = String(raw || "").trim();
+  if (!trimmed) return "";
+
+  try {
+    const url = new URL(trimmed);
+    if (url.hostname.endsWith("twitch.tv")) {
+      const maybeChannel = url.pathname.split("/").find((part) => part);
+      if (maybeChannel) return maybeChannel.toLowerCase();
+    }
+  } catch {}
+
+  const withoutPrefix = trimmed.replace(/^https?:\/\/(www\.)?twitch\.tv\//i, "");
+  const normalized = withoutPrefix.replace(/^#/, "").split("/")[0];
+
+  return normalized.toLowerCase();
+}
+
 function updateConnectionStatus(id, status) {
   const conn = connections.get(id);
   if (!conn) return;
@@ -354,7 +372,7 @@ async function connectNiconico(liveUrlOrId) {
 }
 
 async function connectTwitch(channelRaw) {
-  const channel = String(channelRaw || "").trim().replace(/^#/, "").toLowerCase();
+  const channel = parseTwitchChannel(channelRaw);
   if (!channel) {
     setStatus("チャンネル名を入力してね");
     return;
