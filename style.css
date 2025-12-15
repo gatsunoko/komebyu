@@ -63,6 +63,38 @@ main { padding: 12px; display: flex; flex-direction: column; gap: 12px; }
   margin-bottom: 8px;
 }
 
+#connections {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.connection-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 8px 10px;
+  border: 1px solid #2a2a35;
+  border-radius: 10px;
+  background: #0d0d12;
+}
+
+.connection-info {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.connection-label {
+  font-weight: 700;
+}
+
+.connection-status {
+  font-size: 12px;
+  opacity: 0.85;
+}
+
 #list {
   height: 520px;
   overflow: auto;
@@ -81,6 +113,14 @@ main { padding: 12px; display: flex; flex-direction: column; gap: 12px; }
 .msg:last-child { border-bottom: none; }
 
 .name { font-weight: 700; margin-right: 4px; }
+.source {
+  font-size: 12px;
+  opacity: 0.85;
+  margin-right: 6px;
+  padding: 2px 6px;
+  border-radius: 8px;
+  background: #1c1c27;
+}
 .msg.broadcaster .name { text-decoration: underline; }
 .msg.moderator .name { opacity: 0.95; }
 .msg.subscriber .name { opacity: 0.95; }
