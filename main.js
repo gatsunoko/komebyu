@@ -512,15 +512,16 @@ async function connectNiconico(liveUrlOrId) {
             if (!lengthInfo) break;
             const messageLength = Number(lengthInfo.value);
             const headerOffset = lengthInfo.length;
-            if (buffer.length < headerOffset + messageLength) break;
+            const chunkEnd = headerOffset + messageLength;
+            if (buffer.length < chunkEnd) break;
             if (messageLength < 1) {
-              buffer = buffer.slice(headerOffset + messageLength);
+              buffer = buffer.slice(headerOffset);
               continue;
             }
 
-            const payload = buffer.slice(headerOffset + 1, headerOffset + messageLength);
-            const rawChunk = buffer.slice(headerOffset, headerOffset + messageLength);
-            buffer = buffer.slice(headerOffset + messageLength);
+            const payload = buffer.slice(headerOffset, chunkEnd);
+            const rawChunk = buffer.slice(0, chunkEnd);
+            buffer = buffer.slice(chunkEnd);
 
             if (!firstChunkLogged) {
               logNico("segment chunk0", {
@@ -536,7 +537,11 @@ async function connectNiconico(liveUrlOrId) {
                 handleSegmentMessage(decoded);
               }
             } catch (e) {
-              logNico("segment decode error", e);
+              logNico("segment decode error", {
+                error: e,
+                payloadHex: payload.slice(0, 32).toString("hex"),
+                payloadLength: payload.length,
+              });
             }
           }
         }
@@ -659,19 +664,20 @@ async function connectNiconico(liveUrlOrId) {
             buffer = Buffer.concat([buffer, Buffer.from(value)]);
 
             while (buffer.length) {
-              const lengthInfo = readVarint(buffer, 0);
-              if (!lengthInfo) break;
-              const messageLength = Number(lengthInfo.value);
-              const offset = lengthInfo.length;
-              if (buffer.length < offset + messageLength) break;
-              if (messageLength < 1) {
-                buffer = buffer.slice(offset + messageLength);
-                continue;
-              }
+            const lengthInfo = readVarint(buffer, 0);
+            if (!lengthInfo) break;
+            const messageLength = Number(lengthInfo.value);
+            const offset = lengthInfo.length;
+            const chunkEnd = offset + messageLength;
+            if (buffer.length < chunkEnd) break;
+            if (messageLength < 1) {
+              buffer = buffer.slice(offset);
+              continue;
+            }
 
-              const payload = buffer.slice(offset + 1, offset + messageLength);
-              const rawChunk = buffer.slice(offset, offset + messageLength);
-              buffer = buffer.slice(offset + messageLength);
+            const payload = buffer.slice(offset, chunkEnd);
+            const rawChunk = buffer.slice(0, chunkEnd);
+            buffer = buffer.slice(chunkEnd);
 
               if (!firstChunkLogged) {
                 logNico("view chunk0", {
@@ -692,7 +698,11 @@ async function connectNiconico(liveUrlOrId) {
                   logNico("segment uri =", nextUri);
                 }
               } catch (e) {
-                logDecodeError(e);
+                logDecodeError({
+                  error: e,
+                  payloadHex: payload.slice(0, 32).toString("hex"),
+                  payloadLength: payload.length,
+                });
               }
             }
           }
