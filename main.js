@@ -272,7 +272,9 @@ async function connectNiconico(liveUrlOrId) {
     }
 
     if (data.type === "room") {
-      startCommentSocket(data.data?.messageServer || data.data);
+      const messageServer = data.data?.messageServer || data.data;
+      const threadId = data.data?.threadId;
+      startCommentSocket({ ...messageServer, threadId });
       return;
     }
 
