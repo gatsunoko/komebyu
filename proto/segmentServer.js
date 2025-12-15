@@ -199,12 +199,12 @@ const decodeMessage = (reader, length) => {
 
 const decodeChunkedMessage = (buf) => {
   const reader = buf instanceof Reader ? buf : new Reader(buf);
-  const message = { message: [] };
+  const message = { messages: [] };
   while (reader.pos < reader.len) {
     const tag = reader.uint32();
     switch (tag >>> 3) {
       case 1:
-        message.message.push(decodeMessage(reader, reader.uint32()));
+        message.messages.push(decodeMessage(reader, reader.uint32()));
         break;
       default:
         reader.skipType(tag & 7);
