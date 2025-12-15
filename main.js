@@ -2,11 +2,8 @@ const { app, BrowserWindow, ipcMain } = require("electron");
 const path = require("path");
 const tmi = require("tmi.js");
 const WebSocket = require("ws");
-const {
-  decodeMessageServerPayload,
-  extractSegmentUrisFromView,
-} = require("./proto/messageServer");
-const { decodeSegmentPayload } = require("./proto/segmentServer");
+const { decodeChunkedEntry } = require("./proto/messageServer");
+const { decodeChunkedMessage } = require("./proto/segmentServer");
 
 const NICO_DEBUG = process.env.NICO_DEBUG !== "false";
 
@@ -94,139 +91,6 @@ function readVarint(buf, offset = 0) {
     shift += 7n;
   }
   return null;
-}
-
-function readLengthDelimited(buf, offset) {
-  const lenInfo = readVarint(buf, offset);
-  if (!lenInfo) return null;
-  const len = Number(lenInfo.value);
-  const start = offset + lenInfo.length;
-  const end = start + len;
-  if (end > buf.length) return null;
-  return { value: buf.slice(start, end), bytesRead: lenInfo.length + len };
-}
-
-function decodeString(buf, offset) {
-  const data = readLengthDelimited(buf, offset);
-  if (!data) return null;
-  return { value: Buffer.from(data.value).toString("utf8"), bytesRead: data.bytesRead };
-}
-
-function decodeChatMessage(buf) {
-  let pos = 0;
-  const chat = {};
-  while (pos < buf.length) {
-    const tagInfo = readVarint(buf, pos);
-    if (!tagInfo) break;
-    pos += tagInfo.length;
-    const field = tagInfo.value >> 3;
-    const wire = tagInfo.value & 0x7;
-    if (wire === 2) {
-      const strVal = decodeString(buf, pos);
-      if (!strVal) break;
-      pos += strVal.bytesRead;
-      if (field === 1) chat.roomName = strVal.value;
-      else if (field === 2) chat.threadId = strVal.value;
-      else if (field === 5) chat.content = strVal.value;
-      else if (field === 6) chat.userId = strVal.value;
-      else if (field === 7) chat.name = strVal.value;
-      else if (field === 8) chat.mail = strVal.value;
-      continue;
-    }
-    if (wire === 0) {
-      const intVal = readVarint(buf, pos);
-      if (!intVal) break;
-      pos += intVal.length;
-      if (field === 3) chat.no = intVal.value;
-      else if (field === 4) chat.vpos = intVal.value;
-      else if (field === 9) chat.anonymous = Boolean(intVal.value);
-      continue;
-    }
-    break;
-  }
-  return chat;
-}
-
-function decodeReconnect(buf) {
-  let pos = 0;
-  const data = {};
-  while (pos < buf.length) {
-    const tag = readVarint(buf, pos);
-    if (!tag) break;
-    pos += tag.length;
-    const field = tag.value >> 3;
-    const wire = tag.value & 0x7;
-    if (wire === 0) {
-      const intVal = readVarint(buf, pos);
-      if (!intVal) break;
-      pos += intVal.length;
-      if (field === 1) data.at = intVal.value;
-      continue;
-    }
-    if (wire === 2) {
-      const strVal = decodeString(buf, pos);
-      if (!strVal) break;
-      pos += strVal.bytesRead;
-      if (field === 2) data.streamUrl = strVal.value;
-      continue;
-    }
-    break;
-  }
-  return data;
-}
-
-function decodeError(buf) {
-  let pos = 0;
-  const data = {};
-  while (pos < buf.length) {
-    const tag = readVarint(buf, pos);
-    if (!tag) break;
-    pos += tag.length;
-    const field = tag.value >> 3;
-    const wire = tag.value & 0x7;
-    if (wire === 2) {
-      const strVal = decodeString(buf, pos);
-      if (!strVal) break;
-      pos += strVal.bytesRead;
-      if (field === 1) data.code = strVal.value;
-      else if (field === 2) data.message = strVal.value;
-      continue;
-    }
-    break;
-  }
-  return data;
-}
-
-function decodeRoom(buf) {
-  let pos = 0;
-  const data = {};
-  while (pos < buf.length) {
-    const tag = readVarint(buf, pos);
-    if (!tag) break;
-    pos += tag.length;
-    const field = tag.value >> 3;
-    const wire = tag.value & 0x7;
-    if (wire === 2) {
-      if (field === 4) {
-        const nested = readLengthDelimited(buf, pos);
-        if (!nested) break;
-        pos += nested.bytesRead;
-        const decoded = decodeRoom(nested.value);
-        data.messageServer = decoded;
-        continue;
-      }
-      const strVal = decodeString(buf, pos);
-      if (!strVal) break;
-      pos += strVal.bytesRead;
-      if (field === 1) data.name = strVal.value;
-      else if (field === 2) data.messageServerUrl = strVal.value;
-      else if (field === 3) data.threadId = strVal.value;
-      else if (field === 1) data.url = strVal.value;
-      continue;
-    }
-    break;
-  }
-  return data;
 }
 
 let win = null;
@@ -331,15 +195,14 @@ async function connectNiconico(liveUrlOrId) {
   }
 
   let viewAbort = null;
+  const segmentConnections = new Map();
 
   const connection = {
     id,
     type: "niconico",
     label: `ニコ生 ${liveId}`,
     status: "ニコ生に接続中…",
-    disconnect: async () => {
-      if (viewAbort) viewAbort.abort();
-    },
+    disconnect: null,
   };
 
   connections.set(id, connection);
@@ -351,14 +214,10 @@ async function connectNiconico(liveUrlOrId) {
   let html;
   try {
     const res = await fetch(watchUrl, {
-      headers: {
-        "User-Agent": "komebyu/1.0 (+https://github.com/)",
-      },
+      headers: { "User-Agent": "komebyu/1.0 (+https://github.com/)" },
     });
 
-    setStatus(
-      `ニコ生 ${liveId} 視聴ページ取得完了 (status: ${res.status}, step1)`
-    );
+    setStatus(`ニコ生 ${liveId} 視聴ページ取得完了 (status: ${res.status}, step1)`);
 
     if (!res.ok) {
       await disconnectConnection(id);
@@ -373,96 +232,92 @@ async function connectNiconico(liveUrlOrId) {
     return;
   }
 
-    logNico("step2: watch websocket url search");
+  logNico("step2: watch websocket url search");
 
-      const findProps = () => {
-      const embeddedMatch = html.match(
-        /<script[^>]*id="embedded-data"[^>]*data-props="([^"]+)"/i
-      );
-      if (embeddedMatch) return embeddedMatch[1];
-      const genericMatch = html.match(/data-props="([^"]+)"/i);
-      if (genericMatch) return genericMatch[1];
-      return null;
-    };
+  const findProps = () => {
+    const embeddedMatch = html.match(/<script[^>]*id="embedded-data"[^>]*data-props="([^"]+)"/i);
+    if (embeddedMatch) return embeddedMatch[1];
+    const genericMatch = html.match(/data-props="([^"]+)"/i);
+    if (genericMatch) return genericMatch[1];
+    return null;
+  };
 
-    let watchWsUrl = null;
+  let watchWsUrl = null;
 
-    const rawProps = findProps();
-    if (rawProps) {
+  const rawProps = findProps();
+  if (rawProps) {
+    try {
+      const decodedJson = decodeHtmlEntities(rawProps);
+      const props = JSON.parse(decodedJson);
+      logNico("data-props parse success");
+      watchWsUrl =
+        props?.site?.relive?.watchServer?.url ||
+        props?.site?.program?.watchServer?.url ||
+        props?.program?.broadcaster?.socialGroup?.watchServer?.url ||
+        props?.program?.broadcast?.watchServer?.url ||
+        props?.watchServer?.url;
+    } catch (e) {
+      logNico("data-props parse failed", e);
+    }
+  }
+
+  if (!watchWsUrl) {
+    const matchUrl = html.match(/wss?:\/[\w./:%#@\-?=~_|!$&'()*+,;]+/i);
+    if (matchUrl) watchWsUrl = matchUrl[0];
+  }
+
+  if (watchWsUrl) {
+    const cleaned = decodeHtmlEntities(String(watchWsUrl)).trim();
+    const match = cleaned.match(/wss?:\/\/[^"'<>\s]+/);
+    watchWsUrl = match ? match[0] : null;
+  }
+
+  if (!watchWsUrl) {
+    setStatus("NDGRのwatch WS URLが取得できませんでした (step2)");
+    await disconnectConnection(id);
+    return;
+  }
+
+  setStatus(`step2a: watch WS url = ${watchWsUrl}`);
+
+  const connectionAbortController = new AbortController();
+  let messageCount = 0;
+  let viewUri = null;
+  let watchSocket = null;
+  let watchKeepTimer = null;
+  let watchReconnectTimer = null;
+  let watchReconnectDelay = 1000;
+
+  const cleanupSegments = async () => {
+    const pending = Array.from(segmentConnections.values());
+    segmentConnections.clear();
+    for (const state of pending) {
       try {
-        const decodedJson = decodeHtmlEntities(rawProps);
-        const props = JSON.parse(decodedJson);
-        logNico("data-props parse success");
-        watchWsUrl =
-          props?.site?.relive?.watchServer?.url ||
-          props?.site?.program?.watchServer?.url ||
-          props?.program?.broadcaster?.socialGroup?.watchServer?.url ||
-          props?.program?.broadcast?.watchServer?.url ||
-          props?.watchServer?.url;
-      } catch (e) {
-        logNico("data-props parse failed", e);
-      }
+        state.controller.abort();
+        await state.promise;
+      } catch {}
     }
+  };
 
-    if (!watchWsUrl) {
-      const matchUrl = html.match(/wss?:\/\/[\w./:%#@\-?=~_|!$&'()*+,;]+/i);
-      if (matchUrl) {
-        watchWsUrl = matchUrl[0];
-      }
+  const cleanup = () => {
+    if (watchReconnectTimer) {
+      clearTimeout(watchReconnectTimer);
+      watchReconnectTimer = null;
     }
-
-    if (watchWsUrl) {
-      const cleaned = decodeHtmlEntities(String(watchWsUrl)).trim();
-      const match = cleaned.match(/wss?:\/\/[^"'<>\s]+/);
-      watchWsUrl = match ? match[0] : null;
+    if (watchKeepTimer) {
+      clearInterval(watchKeepTimer);
+      watchKeepTimer = null;
     }
-
-    if (!watchWsUrl) {
-      setStatus("NDGRのwatch WS URLが取得できませんでした (step2)");
-      await disconnectConnection(id);
-      return;
+    if (watchSocket) {
+      try {
+        watchSocket.close();
+      } catch {}
+      watchSocket = null;
     }
-
-    setStatus(`step2a: watch WS url = ${watchWsUrl}`);
-
-    const connectionAbortController = new AbortController();
-    let messageCount = 0;
-    let viewUri = null;
-    let segmentUrl = null;
-    let segmentAbort = null;
-    let segmentPromise = null;
-    let segmentRunning = false;
-    let segmentReconnectDelay = 1000;
-    let segmentCursor = null;
-    let watchSocket = null;
-    let watchKeepTimer = null;
-    let watchReconnectTimer = null;
-    let watchReconnectDelay = 1000;
-
-    connectionAbortController.signal.addEventListener("abort", () => {
-      viewAbort?.abort();
-      segmentAbort?.abort();
-    });
-
-    const cleanup = () => {
-      if (watchReconnectTimer) {
-        clearTimeout(watchReconnectTimer);
-        watchReconnectTimer = null;
-      }
-      if (watchKeepTimer) {
-        clearInterval(watchKeepTimer);
-        watchKeepTimer = null;
-      }
-      if (watchSocket) {
-        try {
-          watchSocket.close();
-        } catch {}
-        watchSocket = null;
-      }
-      connectionAbortController.abort();
-      viewAbort?.abort();
-      segmentAbort?.abort();
-    };
+    connectionAbortController.abort();
+    viewAbort?.abort();
+    cleanupSegments();
+  };
 
   connection.disconnect = async () => cleanup();
 
@@ -477,37 +332,123 @@ async function connectNiconico(liveUrlOrId) {
     }
   };
 
-  const connectSegmentStream = async (uri) => {
+  const startSegmentStream = (uri) => {
     if (!uri || connectionAbortController.signal.aborted) return;
+    if (segmentConnections.has(uri)) return;
 
-    if (segmentRunning && uri === segmentUrl) {
-      return;
-    }
+    const controller = new AbortController();
+    const state = { controller, promise: null };
+    segmentConnections.set(uri, state);
 
-    if (segmentRunning) {
-      segmentAbort?.abort();
-      if (segmentPromise) {
-        await segmentPromise.catch(() => {});
-      }
-    }
-
-    segmentAbort = new AbortController();
-    const localAbort = segmentAbort;
-    segmentRunning = true;
-    segmentUrl = uri;
-    segmentReconnectDelay = 1000;
-
-    logNico("segmentServer uri", uri);
-    setStatus(`segment 接続開始 ${uri}`);
-
-    const runSegment = async () => {
+    state.promise = (async () => {
       let buffer = Buffer.alloc(0);
-      let totalBytes = 0;
-      let reconnectReason = "done";
-      let firstChunkLogged = false;
+      let firstMessageLogged = false;
 
       try {
+        logNico("segmentServer uri", uri);
+        setStatus(`segment 接続開始 ${uri}`);
+
         const response = await fetch(uri, {
+          signal: controller.signal,
+          headers: {
+            "User-Agent": "komebyu/1.0 (+https://github.com/)",
+            Accept: "application/octet-stream",
+          },
+        });
+
+        if (!response.ok || !response.body) {
+          setStatus(`segment 接続失敗 ${response.status}`);
+          return;
+        }
+
+        const reader = response.body.getReader();
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (value && value.length) buffer = Buffer.concat([buffer, Buffer.from(value)]);
+
+          while (buffer.length) {
+            const lengthInfo = readVarint(buffer, 0);
+            if (!lengthInfo) break;
+            const messageLength = Number(lengthInfo.value);
+            const offset = lengthInfo.length;
+            const chunkEnd = offset + messageLength;
+            if (buffer.length < chunkEnd) break;
+            if (messageLength < 1) {
+              buffer = buffer.slice(offset);
+              continue;
+            }
+
+            const payload = buffer.slice(offset, chunkEnd);
+            buffer = buffer.slice(chunkEnd);
+
+            try {
+              const decoded = decodeChunkedMessage(payload);
+              const envelopes = Array.isArray(decoded?.message)
+                ? decoded.message
+                : decoded
+                  ? [decoded]
+                  : [];
+
+              for (const msg of envelopes) {
+                if (msg?.chat?.content && !firstMessageLogged) {
+                  logNico("first segment chat", msg.chat.content);
+                  firstMessageLogged = true;
+                  setStatus("step5: コメント受信開始 (1件目受信)");
+                  updateConnectionStatus(id, "接続中 (コメント受信中)");
+                }
+
+                if (msg?.chat?.content) {
+                  messageCount += 1;
+                  send("message", {
+                    connectionId: id,
+                    source: connection.label,
+                    user: msg.chat.name || msg.chat.userId || "niconico",
+                    text: msg.chat.content,
+                    badges: {},
+                    emotes: null,
+                  });
+                }
+
+                if (msg?.reconnect?.streamUrl) {
+                  const at = msg.reconnect.at ?? "now";
+                  const nextUri = ensureAtParam(msg.reconnect.streamUrl, at);
+                  startSegmentStream(nextUri);
+                }
+              }
+            } catch (err) {
+              logNico("segment decode error", err);
+            }
+          }
+        }
+      } catch (e) {
+        if (!controller.signal.aborted) {
+          setStatus(`segment エラー: ${e?.message || String(e)}`);
+        }
+      } finally {
+        segmentConnections.delete(uri);
+      }
+    })();
+  };
+
+  const connectViewStream = async (targetBase) => {
+    let nextAt = "now";
+
+    while (!connectionAbortController.signal.aborted && targetBase) {
+      if (viewAbort) viewAbort.abort();
+      viewAbort = new AbortController();
+      const localAbort = viewAbort;
+      let reconnectAt = null;
+
+      try {
+        let buffer = Buffer.alloc(0);
+        let firstChunkLogged = false;
+        const targetUrl = ensureAtParam(targetBase, nextAt);
+
+        updateConnectionStatus(id, "NDGR ビュー取得中…");
+        setStatus(`step3: view/v4 接続 ${targetUrl}`);
+
+        const response = await fetch(targetUrl, {
           signal: localAbort.signal,
           headers: {
             "User-Agent": "komebyu/1.0 (+https://github.com/)",
@@ -516,180 +457,18 @@ async function connectNiconico(liveUrlOrId) {
         });
 
         if (!response.ok || !response.body) {
-          reconnectReason = `bad-status-${response.status}`;
-          return { reason: reconnectReason, totalBytes };
+          setStatus(`view/v4 取得失敗 (${response.status})`);
+          break;
         }
 
         const reader = response.body.getReader();
         while (true) {
           const { done, value } = await reader.read();
-          if (done) {
-            reconnectReason = "done";
-            break;
-          }
-          if (value && value.length) {
-            const chunk = Buffer.from(value);
-            totalBytes += chunk.length;
-            buffer = Buffer.concat([buffer, chunk]);
-          }
+          if (done) break;
+          if (!value) continue;
+          buffer = Buffer.concat([buffer, Buffer.from(value)]);
 
           while (buffer.length) {
-            const lengthInfo = readVarint(buffer, 0);
-            if (!lengthInfo) break;
-            const messageLength = Number(lengthInfo.value);
-            const headerOffset = lengthInfo.length;
-            const chunkEnd = headerOffset + messageLength;
-            if (buffer.length < chunkEnd) break;
-            if (messageLength < 1) {
-              buffer = buffer.slice(headerOffset);
-              continue;
-            }
-
-            const payload = buffer.slice(headerOffset, chunkEnd);
-            const rawChunk = buffer.slice(0, chunkEnd);
-            buffer = buffer.slice(chunkEnd);
-
-            if (!firstChunkLogged) {
-              logNico("segment chunk0", {
-                hex: rawChunk.toString("hex"),
-                length: rawChunk.length,
-              });
-              firstChunkLogged = true;
-            }
-
-            try {
-              const decoded = decodeSegmentPayload(payload);
-              if (decoded && Object.keys(decoded).length) {
-                handleSegmentMessage(decoded);
-              }
-            } catch (e) {
-              logNico("segment decode error", {
-                error: e,
-                payloadHex: payload.slice(0, 32).toString("hex"),
-                payloadLength: payload.length,
-              });
-            }
-          }
-        }
-      } catch (e) {
-        reconnectReason = localAbort.signal.aborted ? "abort" : "stream-error";
-      }
-
-      return { reason: reconnectReason, totalBytes };
-    };
-
-    segmentPromise = runSegment();
-
-    const result = await segmentPromise;
-    const reason = result?.reason || (segmentAbort.signal.aborted ? "abort" : "unknown");
-    const totalBytes = result?.totalBytes ?? 0;
-
-    segmentRunning = false;
-    segmentAbort = null;
-
-    logNico("segmentServer ended", { reason, totalBytes });
-    setStatus(`segmentServer end ${reason} bytes=${totalBytes}`);
-
-    if (!connectionAbortController.signal.aborted && reason !== "abort") {
-      const nextUri = segmentUrl || ensureAtParam(uri, segmentCursor || "now");
-      setTimeout(() => connectSegmentStream(nextUri), segmentReconnectDelay);
-      segmentReconnectDelay = Math.min(segmentReconnectDelay * 2, 30000);
-    }
-  };
-
-  const handleSegmentMessage = (msg) => {
-    if (!msg) return;
-    if (msg.ping) return;
-    if (msg.serverTime) return;
-    if (msg.statistics) return;
-
-    if (msg.cursor) {
-      segmentCursor = msg.cursor;
-    }
-
-    if (msg.error) {
-      setStatus(`ニコ生エラー: ${msg.error.code || msg.error.message || "unknown"}`);
-      return;
-    }
-
-    if (msg.disconnect) {
-      updateConnectionStatus(id, `切断: ${msg.disconnect.reason || "unknown"}`);
-      disconnectConnection(id);
-      return;
-    }
-
-    if (msg.reconnect) {
-      if (msg.reconnect.cursor) segmentCursor = msg.reconnect.cursor;
-      if (msg.reconnect.at) segmentCursor = msg.reconnect.at;
-      if (msg.reconnect.streamUrl) segmentUrl = msg.reconnect.streamUrl;
-      return;
-    }
-
-    if (msg.chat && msg.chat.content) {
-      messageCount += 1;
-      if (messageCount === 1) {
-        setStatus("step5: コメント受信開始 (1件目受信)");
-        updateConnectionStatus(id, "接続中 (コメント受信中)");
-      }
-
-      send("message", {
-        connectionId: id,
-        source: connection.label,
-        user: msg.chat.name || msg.chat.userId || "niconico",
-        text: msg.chat.content,
-        badges: {},
-        emotes: null,
-      });
-      return;
-    }
-  };
-
-    const connectStream = async (targetUrl) => {
-      if (connectionAbortController.signal.aborted) return;
-
-      if (viewAbort) {
-        viewAbort.abort();
-      }
-
-      viewAbort = new AbortController();
-      const localAbort = viewAbort;
-
-      const logDecodeError = (err) => {
-        logNico("view decode error", err);
-      };
-
-      let discoveredSegmentUri = null;
-
-      const runView = async () => {
-        let buffer = Buffer.alloc(0);
-        let firstChunkLogged = false;
-
-        try {
-          updateConnectionStatus(id, "NDGR ビュー取得中…");
-          setStatus(`step3: view/v4 接続 ${targetUrl}`);
-
-          const response = await fetch(targetUrl, {
-            signal: localAbort.signal,
-            headers: {
-              "User-Agent": "komebyu/1.0 (+https://github.com/)",
-              Accept: "application/octet-stream",
-            },
-          });
-
-          if (!response.ok || !response.body) {
-            setStatus(`view/v4 取得失敗 (${response.status})`);
-            return;
-          }
-
-          const reader = response.body.getReader();
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            if (!value) continue;
-
-            buffer = Buffer.concat([buffer, Buffer.from(value)]);
-
-            while (buffer.length) {
             const lengthInfo = readVarint(buffer, 0);
             if (!lengthInfo) break;
             const messageLength = Number(lengthInfo.value);
@@ -705,207 +484,184 @@ async function connectNiconico(liveUrlOrId) {
             const rawChunk = buffer.slice(0, chunkEnd);
             buffer = buffer.slice(chunkEnd);
 
-              if (!firstChunkLogged) {
-                logNico("view chunk0", {
-                  hex: rawChunk.toString("hex"),
-                  length: rawChunk.length,
-                });
-                firstChunkLogged = true;
-              }
+            if (!firstChunkLogged) {
+              logNico("view chunk0", {
+                hex: rawChunk.toString("hex"),
+                length: rawChunk.length,
+              });
+              firstChunkLogged = true;
+            }
 
-              try {
-                const decoded = decodeMessageServerPayload(payload);
-                const segmentUris = extractSegmentUrisFromView(decoded, payload);
-                if (segmentUris.length) {
-                  const nextUri = ensureAtParam(segmentUris[0], "now");
-                  if (!discoveredSegmentUri) {
-                    discoveredSegmentUri = nextUri;
-                  }
-                  logNico("segment uri =", nextUri);
+            try {
+              const decoded = decodeChunkedEntry(payload);
+              const entries = Array.isArray(decoded?.entry)
+                ? decoded.entry
+                : decoded
+                  ? [decoded]
+                  : [];
+
+              for (const entry of entries) {
+                if (entry?.segment?.uri) {
+                  const nextUri = ensureAtParam(entry.segment.uri, "now");
+                  logNico("segment uri (view)", nextUri);
+                  startSegmentStream(nextUri);
                 }
-              } catch (e) {
-                logDecodeError({
-                  error: e,
-                  payloadHex: payload.slice(0, 32).toString("hex"),
-                  payloadLength: payload.length,
-                });
+
+                if (entry?.next?.at != null) {
+                  reconnectAt = entry.next.at;
+                  try {
+                    localAbort.abort();
+                  } catch {}
+                  break;
+                }
+
+                if (entry?.reconnect?.streamUrl) {
+                  const at = entry.reconnect.at ?? "now";
+                  startSegmentStream(ensureAtParam(entry.reconnect.streamUrl, at));
+                }
               }
+            } catch (e) {
+              logNico("view decode error", {
+                error: e,
+                payloadHex: payload.slice(0, 32).toString("hex"),
+                payloadLength: payload.length,
+              });
             }
           }
-        } catch (e) {
-          if (!localAbort.signal.aborted) {
-            setStatus(`view/v4 取得エラー: ${e?.message || String(e)}`);
-          }
         }
-      };
-
-      await runView();
+      } catch (e) {
+        if (!localAbort.signal.aborted) {
+          setStatus(`view/v4 取得エラー: ${e?.message || String(e)}`);
+        }
+      }
 
       viewAbort = null;
-      logNico("view/v4 handling finished");
+      if (reconnectAt == null) break;
+      nextAt = reconnectAt;
+    }
+  };
 
-      if (connectionAbortController.signal.aborted) return;
+  const handleWatchMessage = (raw) => {
+    const text = typeof raw === "string" ? raw : String(raw);
+    let parsed;
+    try {
+      parsed = JSON.parse(text);
+    } catch (e) {
+      logNico("watch ws json parse failed", e, text.slice(0, 2000));
+      return;
+    }
 
-      if (discoveredSegmentUri) {
-        segmentUrl = discoveredSegmentUri;
-        logNico("segment uri =", segmentUrl);
-        setStatus("step4: コメント取得開始");
-        connectSegmentStream(segmentUrl);
-      }
-    };
-
-    const handleWatchMessage = (raw) => {
-      const text = typeof raw === "string" ? raw : String(raw);
-      let parsed;
+    if (parsed.type === "ping") {
       try {
-        parsed = JSON.parse(text);
-      } catch (e) {
-        logNico("watch ws json parse failed", e, text.slice(0, 2000));
-        return;
+        watchSocket?.send(JSON.stringify({ type: "pong" }));
+      } catch {}
+      return;
+    }
+
+    if (parsed.type === "seat" || parsed.type === "room") {
+      try {
+        watchSocket?.send(JSON.stringify({ type: "keepSeat" }));
+      } catch {}
+    }
+
+    const candidateUri =
+      parsed?.data?.messageServer?.uri ||
+      parsed?.data?.viewUri ||
+      parsed?.room?.messageServer?.uri ||
+      parsed?.room?.viewUri;
+
+    if (candidateUri && candidateUri.includes("mpn.live.nicovideo.jp/api/view")) {
+      if (viewUri !== candidateUri) {
+        viewUri = candidateUri;
+        logNico("view uri", viewUri);
+        setStatus(`step3: ndgr viewUri = ${viewUri}`);
+        connectViewStream(viewUri);
       }
+      return;
+    }
 
-      logNico("watch ws raw", text.slice(0, 2000));
-      logNico("watch ws parsed keys", Object.keys(parsed || {}));
+    const urlCandidates = Array.from(collectUrlsDeep(parsed));
+    const fallbackView = urlCandidates.find((u) =>
+      u.includes("mpn.live.nicovideo.jp/api/view/")
+    );
+    if (fallbackView && fallbackView !== viewUri) {
+      viewUri = fallbackView;
+      logNico("view uri (fallback)", viewUri);
+      setStatus(`step3: ndgr viewUri = ${viewUri}`);
+      connectViewStream(viewUri);
+    }
+  };
 
-      if (parsed.type === "ping") {
-        try {
-          watchSocket?.send(JSON.stringify({ type: "pong" }));
-        } catch {}
-        return;
-      }
+  const openWatchSocket = () => {
+    if (watchSocket) {
+      try {
+        watchSocket.close();
+      } catch {}
+      watchSocket = null;
+    }
 
-      if (parsed.type === "seat" || parsed.type === "room") {
-        try {
-          watchSocket?.send(JSON.stringify({ type: "keepSeat" }));
-        } catch {}
-      }
+    watchSocket = new WebSocket(watchWsUrl, {
+      headers: { "User-Agent": "komebyu/1.0 (+https://github.com/)" },
+    });
 
-      const candidateUri =
-        parsed?.data?.messageServer?.uri ||
-        parsed?.data?.viewUri ||
-        parsed?.data?.uri ||
-        parsed?.messageServer?.uri ||
-        parsed?.room?.messageServer?.uri ||
-        parsed?.room?.viewUri;
-      const akashicUri =
-        parsed?.data?.akashicMessageServer?.viewUri ||
-        parsed?.akashicMessageServer?.viewUri ||
-        parsed?.room?.akashicMessageServer?.viewUri;
-
-      const urlCandidates = Array.from(collectUrlsDeep(parsed));
-      if (urlCandidates.length) {
-        logNico("watch ws url candidates", urlCandidates);
-      }
-
-      const segmentCandidate = urlCandidates.find((u) =>
-        u.includes("mpn.live.nicovideo.jp/data/segment/")
-      );
-      const viewCandidate =
-        urlCandidates.find((u) => u.includes("mpn.live.nicovideo.jp/api/view/")) ||
-        candidateUri;
-
-      if (segmentCandidate) {
-        const nextUri = ensureAtParam(segmentCandidate, "now");
-        logNico("segment uri (watch)", nextUri);
-        setStatus("step4: コメント取得開始");
-        connectSegmentStream(nextUri);
-      }
-
-      const preferredUri = akashicUri || viewCandidate;
-      const sourceType = akashicUri
-        ? "akashic"
-        : viewCandidate
-          ? "message"
-          : "unknown";
-
-      if (preferredUri) {
-        const preview = text.slice(0, 200);
-        setStatus(`step2c: watch ws recv ${sourceType}Server ${preview}`);
-
-          if (preferredUri.includes("mpn.live.nicovideo.jp/api/view")) {
-            if (viewUri !== preferredUri) {
-              viewUri = preferredUri;
-              setStatus(`step3: ndgr viewUri (${sourceType}) = ${viewUri}`);
-              connectStream(ensureAtParam(viewUri, "now"));
-            }
-          }
-        }
-      };
-
-    const openWatchSocket = () => {
-      if (watchSocket) {
-        try {
-          watchSocket.close();
-        } catch {}
-        watchSocket = null;
-      }
-
-      logNico("watch ws url len", String(watchWsUrl).length);
-      logNico("watch ws url head", String(watchWsUrl).slice(0, 200));
-      logNico("watch ws url tail", String(watchWsUrl).slice(-120));
-
-      watchSocket = new WebSocket(watchWsUrl, {
-        headers: { "User-Agent": "komebyu/1.0 (+https://github.com/)" },
-      });
-
-      watchSocket.on("open", () => {
-        watchReconnectDelay = 1000;
-        setStatus("step2b: watch ws open");
-        const startWatching = {
-          type: "startWatching",
-          data: {
-            stream: {
-              quality: "high",
-              protocol: "hls",
-              latency: "low",
-              chasePlay: false,
-            },
-            room: { protocol: "webSocket", commentable: true },
-            reconnect: false,
+    watchSocket.on("open", () => {
+      watchReconnectDelay = 1000;
+      setStatus("step2b: watch ws open");
+      const startWatching = {
+        type: "startWatching",
+        data: {
+          stream: {
+            quality: "high",
+            protocol: "hls",
+            latency: "low",
+            chasePlay: false,
           },
-        };
+          room: { protocol: "webSocket", commentable: true },
+          reconnect: false,
+        },
+      };
+      try {
+        watchSocket.send(JSON.stringify(startWatching));
+      } catch (e) {
+        logNico("watch ws startWatching send failed", e);
+      }
+
+      if (watchKeepTimer) clearInterval(watchKeepTimer);
+      watchKeepTimer = setInterval(() => {
         try {
-          watchSocket.send(JSON.stringify(startWatching));
-        } catch (e) {
-          logNico("watch ws startWatching send failed", e);
-        }
+          if (watchSocket?.readyState === WebSocket.OPEN) {
+            watchSocket.ping();
+            watchSocket.send(JSON.stringify({ type: "keepSeat" }));
+          }
+        } catch {}
+      }, 30000);
+    });
 
-        if (watchKeepTimer) clearInterval(watchKeepTimer);
-        watchKeepTimer = setInterval(() => {
-          try {
-            if (watchSocket?.readyState === WebSocket.OPEN) {
-              watchSocket.ping();
-              watchSocket.send(JSON.stringify({ type: "keepSeat" }));
-            }
-          } catch {}
-        }, 30000);
-      });
+    watchSocket.on("message", (data) => {
+      handleWatchMessage(data.toString());
+    });
 
-      watchSocket.on("message", (data) => {
-        handleWatchMessage(data.toString());
-      });
+    watchSocket.on("error", (err) => {
+      setStatus(`watch ws error: ${err?.message || String(err)}`);
+    });
 
-      watchSocket.on("error", (err) => {
-        setStatus(`watch ws error: ${err?.message || String(err)}`);
-      });
+    watchSocket.on("close", (code, reason) => {
+      const reasonText = Buffer.isBuffer(reason)
+        ? reason.toString("utf8")
+        : String(reason || "");
+      setStatus(`watch ws close (${code}): ${reasonText}`);
+      if (!connectionAbortController.signal.aborted) {
+        if (watchReconnectTimer) clearTimeout(watchReconnectTimer);
+        watchReconnectTimer = setTimeout(() => {
+          openWatchSocket();
+        }, watchReconnectDelay);
+        watchReconnectDelay = Math.min(watchReconnectDelay * 2, 16000);
+      }
+    });
+  };
 
-      watchSocket.on("close", (code, reason) => {
-        const reasonText = Buffer.isBuffer(reason)
-          ? reason.toString("utf8")
-          : String(reason || "");
-        setStatus(`watch ws close (${code}): ${reasonText}`);
-        if (!connectionAbortController.signal.aborted) {
-          if (watchReconnectTimer) clearTimeout(watchReconnectTimer);
-          watchReconnectTimer = setTimeout(() => {
-            openWatchSocket();
-          }, watchReconnectDelay);
-          watchReconnectDelay = Math.min(watchReconnectDelay * 2, 16000);
-        }
-      });
-    };
-
-    openWatchSocket();
-  }
+  openWatchSocket();
+}
 
 async function connectTwitch(channelRaw) {
   const channel = parseTwitchChannel(channelRaw);
