@@ -426,16 +426,25 @@ async function connectNiconico(liveUrlOrId) {
     const appendAtParam = (uri) =>
       uri.includes("?") ? `${uri}&at=now` : `${uri}?at=now`;
 
-    const abortController = new AbortController();
-    ndgrAbort = abortController;
+    const connectionAbortController = new AbortController();
+    ndgrAbort = connectionAbortController;
 
     let reconnectTimer = null;
     let messageCount = 0;
     let currentStreamUrl = null;
+    let ndgrAbortController = null;
+    let ndgrRunning = false;
+    let ndgrCurrentUrl = null;
+    let ndgrStreamTask = null;
     let viewUri = null;
     let watchSocket = null;
     let watchKeepTimer = null;
     let watchReconnectTimer = null;
+    let watchReconnectDelay = 1000;
+
+    connectionAbortController.signal.addEventListener("abort", () => {
+      ndgrAbortController?.abort();
+    });
 
     const cleanup = () => {
       if (reconnectTimer) {
@@ -456,7 +465,8 @@ async function connectNiconico(liveUrlOrId) {
         } catch {}
         watchSocket = null;
       }
-      abortController.abort();
+      connectionAbortController.abort();
+      ndgrAbortController?.abort();
     };
 
   connection.disconnect = async () => cleanup();
@@ -533,69 +543,133 @@ async function connectNiconico(liveUrlOrId) {
   };
 
     const connectStream = async (targetUrl) => {
-      updateConnectionStatus(id, "NDGR コメントストリーム接続中…");
-      setStatus(`step4: ストリーム接続開始 ${targetUrl}`);
-      currentStreamUrl = targetUrl;
-    let response;
-    try {
-      response = await fetch(targetUrl, {
-        signal: abortController.signal,
-        headers: {
-          "User-Agent": "komebyu/1.0 (+https://github.com/)",
-          Accept: "application/octet-stream",
-        },
-      });
-    } catch (e) {
-      if (abortController.signal.aborted) return;
-      setStatus(`NDGR接続失敗: ${e?.message || String(e)}`);
-      return;
-    }
+      if (connectionAbortController.signal.aborted) return;
 
-    logNico("NDGR stream status", response.status);
-    if (!response.ok || !response.body) {
-      setStatus(`NDGRストリーム取得失敗 (${response.status})`);
-      return;
-    }
-
-    const reader = response.body.getReader();
-    let buffer = Buffer.alloc(0);
-
-    updateConnectionStatus(id, "NDGR コメント受信中");
-
-    while (true) {
-      let chunk;
-      try {
-        const { done, value } = await reader.read();
-        if (done) break;
-        chunk = Buffer.from(value);
-      } catch (e) {
-        if (abortController.signal.aborted) break;
-        setStatus(`NDGR読込エラー: ${e?.message || String(e)}`);
-        break;
+      if (ndgrRunning && targetUrl === ndgrCurrentUrl) {
+        logNico("NDGR stream already running for", targetUrl);
+        return;
       }
 
-      if (chunk && chunk.length) buffer = Buffer.concat([buffer, chunk]);
-
-      while (buffer.length) {
-        const lengthInfo = decodeVarint(buffer, 0);
-        if (!lengthInfo) break;
-        const messageLength = lengthInfo.value;
-        const start = lengthInfo.length;
-        if (buffer.length < start + messageLength) break;
-
-        const messageBytes = buffer.slice(start, start + messageLength);
-        buffer = buffer.slice(start + messageLength);
-
-        const decoded = decodeNdgrMessage(messageBytes);
-        if (decoded && Object.keys(decoded).length) {
-          handleMessage(decoded);
+      if (ndgrRunning) {
+        ndgrAbortController?.abort();
+        if (ndgrStreamTask) {
+          try {
+            await ndgrStreamTask;
+          } catch (e) {
+            logNico("previous NDGR stream ended", e);
+          }
         }
       }
-    }
 
-      if (!abortController.signal.aborted) {
-        setStatus("NDGRストリームが切断されました 再接続を試行します");
-        reconnectTimer = setTimeout(() => connectStream(targetUrl), 1500);
+      const localAbort = new AbortController();
+      ndgrAbortController = localAbort;
+      ndgrCurrentUrl = targetUrl;
+      ndgrRunning = true;
+
+      const runStream = async () => {
+        const abortHandler = () => localAbort.abort();
+        connectionAbortController.signal.addEventListener("abort", abortHandler);
+
+        let stallTimer = null;
+        let buffer = Buffer.alloc(0);
+        let totalBytes = 0;
+        let lastBytes = 0;
+
+        try {
+          updateConnectionStatus(id, "NDGR コメントストリーム接続中…");
+          setStatus(`step4: ストリーム接続開始 ${targetUrl}`);
+          currentStreamUrl = targetUrl;
+
+          let response;
+          try {
+            response = await fetch(targetUrl, {
+              signal: localAbort.signal,
+              headers: {
+                "User-Agent": "komebyu/1.0 (+https://github.com/)",
+                Accept: "application/octet-stream",
+              },
+            });
+          } catch (e) {
+            if (localAbort.signal.aborted) return;
+            setStatus(`NDGR接続失敗: ${e?.message || String(e)}`);
+            return;
+          }
+
+          logNico("NDGR stream status", response.status);
+          if (!response.ok || !response.body) {
+            setStatus(`NDGRストリーム取得失敗 (${response.status})`);
+            return;
+          }
+
+          const reader = response.body.getReader();
+          updateConnectionStatus(id, "NDGR コメント受信中");
+
+          stallTimer = setInterval(() => {
+            if (localAbort.signal.aborted) return;
+            if (totalBytes === lastBytes) {
+              logNico(
+                "ndgr stream stalled (no new bytes for 5s)",
+                "url",
+                targetUrl,
+                "total",
+                totalBytes
+              );
+            }
+            lastBytes = totalBytes;
+          }, 5000);
+
+          while (true) {
+            let chunk;
+            try {
+              const { done, value } = await reader.read();
+              if (done) break;
+              chunk = Buffer.from(value);
+            } catch (e) {
+              if (localAbort.signal.aborted) break;
+              setStatus(`NDGR読込エラー: ${e?.message || String(e)}`);
+              break;
+            }
+
+            if (chunk && chunk.length) {
+              totalBytes += chunk.length;
+              logNico("ndgr bytes", chunk.length, "total", totalBytes);
+              buffer = Buffer.concat([buffer, chunk]);
+            }
+
+            while (buffer.length) {
+              const lengthInfo = decodeVarint(buffer, 0);
+              if (!lengthInfo) break;
+              const messageLength = lengthInfo.value;
+              const start = lengthInfo.length;
+              if (buffer.length < start + messageLength) break;
+
+              const messageBytes = buffer.slice(start, start + messageLength);
+              buffer = buffer.slice(start + messageLength);
+
+              const decoded = decodeNdgrMessage(messageBytes);
+              if (decoded && Object.keys(decoded).length) {
+                handleMessage(decoded);
+              }
+            }
+          }
+        } finally {
+          if (stallTimer) clearInterval(stallTimer);
+          connectionAbortController.signal.removeEventListener("abort", abortHandler);
+          ndgrRunning = false;
+          ndgrCurrentUrl = null;
+          ndgrAbortController = null;
+        }
+      };
+
+      ndgrStreamTask = runStream();
+
+      try {
+        await ndgrStreamTask;
+      } finally {
+        if (!localAbort.signal.aborted && !connectionAbortController.signal.aborted) {
+          setStatus("NDGRストリームが切断されました 再接続を試行します");
+          reconnectTimer = setTimeout(() => connectStream(targetUrl), 1500);
+        }
       }
     };
 
@@ -661,6 +735,7 @@ async function connectNiconico(liveUrlOrId) {
       });
 
       watchSocket.on("open", () => {
+        watchReconnectDelay = 1000;
         setStatus("step2b: watch ws open");
         const startWatching = {
           type: "startWatching",
@@ -705,9 +780,12 @@ async function connectNiconico(liveUrlOrId) {
           ? reason.toString("utf8")
           : String(reason || "");
         setStatus(`watch ws close (${code}): ${reasonText}`);
-        if (!abortController.signal.aborted) {
+        if (!connectionAbortController.signal.aborted) {
           if (watchReconnectTimer) clearTimeout(watchReconnectTimer);
-          watchReconnectTimer = setTimeout(openWatchSocket, 2000);
+          watchReconnectTimer = setTimeout(() => {
+            openWatchSocket();
+          }, watchReconnectDelay);
+          watchReconnectDelay = Math.min(watchReconnectDelay * 2, 16000);
         }
       });
     };
