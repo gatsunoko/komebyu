@@ -178,7 +178,10 @@ async function connectNiconico(liveUrlOrId) {
     }
 
     try {
-      nicoCommentSocket = new WebSocket(messageServer.uri);
+      nicoCommentSocket = new WebSocket(
+        messageServer.uri,
+        "msg.nicovideo.jp#json"
+      );
     } catch (e) {
       setStatus(`ニコ生: コメント接続失敗 ${e?.message || String(e)}`);
       return;
