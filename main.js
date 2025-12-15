@@ -1,6 +1,7 @@
 const { app, BrowserWindow, ipcMain } = require("electron");
 const path = require("path");
 const tmi = require("tmi.js");
+const WebSocket = require("ws");
 
 const NICO_DEBUG = process.env.NICO_DEBUG !== "false";
 
@@ -19,16 +20,29 @@ function logNico(...args) {
 
 function decodeHtmlEntities(text) {
   if (!text) return "";
-  return String(text)
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&amp;/g, "&")
-    .replace(/&#x([0-9a-fA-F]+);/g, (_, hex) =>
-      String.fromCodePoint(parseInt(hex, 16) || 0)
-    )
-    .replace(/&#(\d+);/g, (_, num) => String.fromCodePoint(parseInt(num, 10) || 0));
+  const named = {
+    amp: "&",
+    lt: "<",
+    gt: ">",
+    quot: '"',
+    apos: "'",
+    nbsp: " ",
+  };
+
+  return String(text).replace(/&(#x?[0-9a-fA-F]+|[a-zA-Z]+);/g, (_, entity) => {
+    if (entity.startsWith("#x") || entity.startsWith("#X")) {
+      const code = parseInt(entity.slice(2), 16);
+      return Number.isFinite(code) ? String.fromCodePoint(code) : "";
+    }
+
+    if (entity.startsWith("#")) {
+      const code = parseInt(entity.slice(1), 10);
+      return Number.isFinite(code) ? String.fromCodePoint(code) : "";
+    }
+
+    if (named[entity]) return named[entity];
+    return `&${entity};`;
+  });
 }
 
 function readVarint(buf, offset = 0) {
@@ -357,59 +371,93 @@ async function connectNiconico(liveUrlOrId) {
     return;
   }
 
-  logNico("step2: data-props search");
-  const propsMatch = html.match(/data-props="([^"]+)"/);
+    logNico("step2: watch websocket url search");
 
-  let messageServerUrl = null;
+    const findProps = () => {
+      const embeddedMatch = html.match(
+        /<script[^>]*id="embedded-data"[^>]*data-props="([^"]+)"/i
+      );
+      if (embeddedMatch) return embeddedMatch[1];
+      const genericMatch = html.match(/data-props="([^"]+)"/i);
+      if (genericMatch) return genericMatch[1];
+      return null;
+    };
 
-  if (propsMatch) {
-    try {
-      const decodedJson = decodeHtmlEntities(propsMatch[1]);
-      const props = JSON.parse(decodedJson);
-      logNico("data-props parse success");
-      const urlFromProps =
-        props?.program?.broadcast?.ndgr?.messageServer?.url ||
-        props?.program?.broadcast?.messageServer?.url ||
-        props?.program?.socialGroup?.messageServerUrl ||
-        props?.site?.program?.socialGroup?.messageServerUrl;
-      if (urlFromProps) messageServerUrl = urlFromProps;
-    } catch (e) {
-      logNico("data-props parse failed", e);
+    let watchWsUrl = null;
+
+    const rawProps = findProps();
+    if (rawProps) {
+      try {
+        const decodedJson = decodeHtmlEntities(rawProps);
+        const props = JSON.parse(decodedJson);
+        logNico("data-props parse success");
+        watchWsUrl =
+          props?.site?.relive?.watchServer?.url ||
+          props?.site?.program?.watchServer?.url ||
+          props?.program?.broadcaster?.socialGroup?.watchServer?.url ||
+          props?.program?.broadcast?.watchServer?.url ||
+          props?.watchServer?.url;
+      } catch (e) {
+        logNico("data-props parse failed", e);
+      }
     }
-  }
 
-  if (!messageServerUrl) {
-    const matchUrl = html.match(/https:\/\/mpn\.live\.nicovideo\.jp\/api\/view\/[^"'\s]+/i);
-    if (matchUrl) {
-      messageServerUrl = matchUrl[0];
+    if (!watchWsUrl) {
+      const matchUrl = html.match(/wss?:\/\/[\w./:%#@\-?=~_|!$&'()*+,;]+/i);
+      if (matchUrl) {
+        watchWsUrl = matchUrl[0];
+      }
     }
-  }
 
-  if (!messageServerUrl) {
-    setStatus("NDGRのコメントサーバーURLが取得できませんでした (step2)");
-    await disconnectConnection(id);
-    return;
-  }
-
-  setStatus(`step3: NDGR message server URL 取得: ${messageServerUrl}`);
-
-  const urlWithNow = messageServerUrl.includes("?")
-    ? `${messageServerUrl}&at=now`
-    : `${messageServerUrl}?at=now`;
-
-  const abortController = new AbortController();
-  ndgrAbort = abortController;
-
-  let reconnectTimer = null;
-  let messageCount = 0;
-
-  const cleanup = () => {
-    if (reconnectTimer) {
-      clearTimeout(reconnectTimer);
-      reconnectTimer = null;
+    if (watchWsUrl) {
+      const cleaned = decodeHtmlEntities(String(watchWsUrl)).trim();
+      const match = cleaned.match(/wss?:\/\/[^"'<>\s]+/);
+      watchWsUrl = match ? match[0] : null;
     }
-    abortController.abort();
-  };
+
+    if (!watchWsUrl) {
+      setStatus("NDGRのwatch WS URLが取得できませんでした (step2)");
+      await disconnectConnection(id);
+      return;
+    }
+
+    setStatus(`step2a: watch WS url = ${watchWsUrl}`);
+
+    const appendAtParam = (uri) =>
+      uri.includes("?") ? `${uri}&at=now` : `${uri}?at=now`;
+
+    const abortController = new AbortController();
+    ndgrAbort = abortController;
+
+    let reconnectTimer = null;
+    let messageCount = 0;
+    let currentStreamUrl = null;
+    let viewUri = null;
+    let watchSocket = null;
+    let watchKeepTimer = null;
+    let watchReconnectTimer = null;
+
+    const cleanup = () => {
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      if (watchReconnectTimer) {
+        clearTimeout(watchReconnectTimer);
+        watchReconnectTimer = null;
+      }
+      if (watchKeepTimer) {
+        clearInterval(watchKeepTimer);
+        watchKeepTimer = null;
+      }
+      if (watchSocket) {
+        try {
+          watchSocket.close();
+        } catch {}
+        watchSocket = null;
+      }
+      abortController.abort();
+    };
 
   connection.disconnect = async () => cleanup();
 
@@ -452,7 +500,7 @@ async function connectNiconico(liveUrlOrId) {
       logNico("NDGR reconnectAt", msg.reconnectAt, "waitMs", waitMs);
       if (reconnectTimer) clearTimeout(reconnectTimer);
       reconnectTimer = setTimeout(() => {
-        connectStream(msg.reconnectAt.streamUrl || urlWithNow);
+        connectStream(msg.reconnectAt.streamUrl || currentStreamUrl);
       }, waitMs);
       return;
     }
@@ -460,7 +508,7 @@ async function connectNiconico(liveUrlOrId) {
     if (msg.room) {
       const roomInfo = msg.room.messageServer || msg.room;
       const uri =
-        roomInfo.messageServerUrl || roomInfo.url || roomInfo.uri || messageServerUrl;
+        roomInfo.messageServerUrl || roomInfo.url || roomInfo.uri || currentStreamUrl;
       logNico("room message", roomInfo);
       setStatus(`step4: NDGRストリーム接続開始 ${uri}`);
       return;
@@ -484,9 +532,10 @@ async function connectNiconico(liveUrlOrId) {
     }
   };
 
-  const connectStream = async (targetUrl) => {
-    updateConnectionStatus(id, "NDGR コメントストリーム接続中…");
-    setStatus(`step4: ストリーム接続開始 ${targetUrl}`);
+    const connectStream = async (targetUrl) => {
+      updateConnectionStatus(id, "NDGR コメントストリーム接続中…");
+      setStatus(`step4: ストリーム接続開始 ${targetUrl}`);
+      currentStreamUrl = targetUrl;
     let response;
     try {
       response = await fetch(targetUrl, {
@@ -544,14 +593,127 @@ async function connectNiconico(liveUrlOrId) {
       }
     }
 
-    if (!abortController.signal.aborted) {
-      setStatus("NDGRストリームが切断されました 再接続を試行します");
-      reconnectTimer = setTimeout(() => connectStream(targetUrl), 1500);
-    }
-  };
+      if (!abortController.signal.aborted) {
+        setStatus("NDGRストリームが切断されました 再接続を試行します");
+        reconnectTimer = setTimeout(() => connectStream(targetUrl), 1500);
+      }
+    };
 
-  connectStream(urlWithNow);
-}
+    const handleWatchMessage = (raw) => {
+      const text = typeof raw === "string" ? raw : String(raw);
+      let parsed;
+      try {
+        parsed = JSON.parse(text);
+      } catch (e) {
+        logNico("watch ws json parse failed", e, text.slice(0, 200));
+        return;
+      }
+
+      if (parsed.type === "ping") {
+        try {
+          watchSocket?.send(JSON.stringify({ type: "pong" }));
+        } catch {}
+        return;
+      }
+
+      if (parsed.type === "seat" || parsed.type === "room") {
+        try {
+          watchSocket?.send(JSON.stringify({ type: "keepSeat" }));
+        } catch {}
+      }
+
+      const candidateUri =
+        parsed?.data?.messageServer?.uri ||
+        parsed?.data?.viewUri ||
+        parsed?.data?.uri ||
+        parsed?.messageServer?.uri ||
+        parsed?.room?.messageServer?.uri ||
+        parsed?.room?.viewUri;
+
+      if (candidateUri) {
+        const preview = text.slice(0, 200);
+        setStatus(`step2c: watch ws recv messageServer ${preview}`);
+
+        if (candidateUri.includes("mpn.live.nicovideo.jp/api/view")) {
+          if (viewUri !== candidateUri || !currentStreamUrl) {
+            viewUri = candidateUri;
+            setStatus(`step3: ndgr viewUri = ${viewUri}`);
+            connectStream(appendAtParam(viewUri));
+          }
+        }
+      }
+    };
+
+    const openWatchSocket = () => {
+      if (watchSocket) {
+        try {
+          watchSocket.close();
+        } catch {}
+        watchSocket = null;
+      }
+
+      logNico("watch ws url len", String(watchWsUrl).length);
+      logNico("watch ws url head", String(watchWsUrl).slice(0, 200));
+      logNico("watch ws url tail", String(watchWsUrl).slice(-120));
+
+      watchSocket = new WebSocket(watchWsUrl, {
+        headers: { "User-Agent": "komebyu/1.0 (+https://github.com/)" },
+      });
+
+      watchSocket.on("open", () => {
+        setStatus("step2b: watch ws open");
+        const startWatching = {
+          type: "startWatching",
+          data: {
+            stream: {
+              quality: "high",
+              protocol: "hls",
+              latency: "low",
+              chasePlay: false,
+            },
+            room: { protocol: "webSocket", commentable: true },
+            reconnect: false,
+          },
+        };
+        try {
+          watchSocket.send(JSON.stringify(startWatching));
+        } catch (e) {
+          logNico("watch ws startWatching send failed", e);
+        }
+
+        if (watchKeepTimer) clearInterval(watchKeepTimer);
+        watchKeepTimer = setInterval(() => {
+          try {
+            if (watchSocket?.readyState === WebSocket.OPEN) {
+              watchSocket.ping();
+              watchSocket.send(JSON.stringify({ type: "keepSeat" }));
+            }
+          } catch {}
+        }, 30000);
+      });
+
+      watchSocket.on("message", (data) => {
+        handleWatchMessage(data.toString());
+      });
+
+      watchSocket.on("error", (err) => {
+        setStatus(`watch ws error: ${err?.message || String(err)}`);
+      });
+
+      watchSocket.on("close", (code, reason) => {
+        const reasonText = Buffer.isBuffer(reason)
+          ? reason.toString("utf8")
+          : String(reason || "");
+        setStatus(`watch ws close (${code}): ${reasonText}`);
+        if (!abortController.signal.aborted) {
+          if (watchReconnectTimer) clearTimeout(watchReconnectTimer);
+          watchReconnectTimer = setTimeout(openWatchSocket, 2000);
+        }
+      });
+    };
+
+    openWatchSocket();
+  }
 
 async function connectTwitch(channelRaw) {
   const channel = parseTwitchChannel(channelRaw);
