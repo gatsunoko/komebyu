@@ -172,19 +172,23 @@ async function connectNiconico(liveUrlOrId) {
   };
 
   function startCommentSocket(messageServer) {
-    if (!messageServer?.uri || !messageServer?.threadId) {
+    const commentUri =
+      messageServer?.uri || messageServer?.messageServerUri || messageServer?.url;
+    const threadId = String(messageServer?.threadId || messageServer?.thread_id || "");
+    const token =
+      messageServer?.accessToken || messageServer?.access_token || messageServer?.token;
+
+    if (!commentUri || !threadId) {
       setStatus("ニコ生: コメントサーバー情報が不足しています");
       return;
     }
 
     try {
-      nicoCommentSocket = new WebSocket(messageServer.uri);
+      nicoCommentSocket = new WebSocket(commentUri, "msg.nicovideo.jp#json");
     } catch (e) {
       setStatus(`ニコ生: コメント接続失敗 ${e?.message || String(e)}`);
       return;
     }
-
-    const threadId = String(messageServer.threadId);
 
     nicoCommentSocket.onopen = () => {
       setStatus(`ニコ生: コメント接続完了 (${threadId})`);
@@ -198,6 +202,7 @@ async function connectNiconico(liveUrlOrId) {
             with_global: 1,
             scores: 1,
             user_id: String(userId),
+            ...(token ? { token } : {}),
           },
         },
         { ping: { content: "rf:0" } },
@@ -272,7 +277,25 @@ async function connectNiconico(liveUrlOrId) {
     }
 
     if (data.type === "room") {
-      startCommentSocket(data.data?.messageServer || data.data);
+      const base = data.data || {};
+      const messageServer =
+        base.messageServer ||
+        base.room?.messageServer ||
+        base.room ||
+        base.messageServerInfo ||
+        base;
+      const threadId =
+        base.threadId ||
+        base.room?.threadId ||
+        base.messageServer?.threadId ||
+        base.room?.messageServer?.threadId;
+
+      if (!messageServer?.uri && !messageServer?.url && !messageServer?.messageServerUri) {
+        setStatus("ニコ生: コメントサーバー情報が見つかりませんでした");
+        return;
+      }
+
+      startCommentSocket({ ...messageServer, threadId });
       return;
     }
 
