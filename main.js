@@ -4,6 +4,14 @@ const tmi = require("tmi.js");
 
 const NICO_DEBUG = process.env.NICO_DEBUG !== "false";
 
+process.on("uncaughtException", (err) => {
+  console.log("[uncaughtException]", err);
+});
+
+process.on("unhandledRejection", (reason) => {
+  console.log("[unhandledRejection]", reason);
+});
+
 function logNico(...args) {
   if (!NICO_DEBUG) return;
   console.log("[nico]", ...args);
@@ -21,6 +29,188 @@ function decodeHtmlEntities(text) {
       String.fromCodePoint(parseInt(hex, 16) || 0)
     )
     .replace(/&#(\d+);/g, (_, num) => String.fromCodePoint(parseInt(num, 10) || 0));
+}
+
+function readVarint(buf, offset = 0) {
+  let val = 0;
+  let shift = 0;
+  let pos = offset;
+  while (pos < buf.length) {
+    const b = buf[pos];
+    val |= (b & 0x7f) << shift;
+    pos += 1;
+    if ((b & 0x80) === 0) {
+      return { value: val >>> 0, length: pos - offset };
+    }
+    shift += 7;
+  }
+  return null;
+}
+
+function readLengthDelimited(buf, offset) {
+  const lenInfo = readVarint(buf, offset);
+  if (!lenInfo) return null;
+  const start = offset + lenInfo.length;
+  const end = start + lenInfo.value;
+  if (end > buf.length) return null;
+  return { value: buf.slice(start, end), bytesRead: lenInfo.length + lenInfo.value };
+}
+
+function decodeString(buf, offset) {
+  const data = readLengthDelimited(buf, offset);
+  if (!data) return null;
+  return { value: Buffer.from(data.value).toString("utf8"), bytesRead: data.bytesRead };
+}
+
+function decodeChatMessage(buf) {
+  let pos = 0;
+  const chat = {};
+  while (pos < buf.length) {
+    const tagInfo = readVarint(buf, pos);
+    if (!tagInfo) break;
+    pos += tagInfo.length;
+    const field = tagInfo.value >> 3;
+    const wire = tagInfo.value & 0x7;
+    if (wire === 2) {
+      const strVal = decodeString(buf, pos);
+      if (!strVal) break;
+      pos += strVal.bytesRead;
+      if (field === 1) chat.roomName = strVal.value;
+      else if (field === 2) chat.threadId = strVal.value;
+      else if (field === 5) chat.content = strVal.value;
+      else if (field === 6) chat.userId = strVal.value;
+      else if (field === 7) chat.name = strVal.value;
+      else if (field === 8) chat.mail = strVal.value;
+      continue;
+    }
+    if (wire === 0) {
+      const intVal = readVarint(buf, pos);
+      if (!intVal) break;
+      pos += intVal.length;
+      if (field === 3) chat.no = intVal.value;
+      else if (field === 4) chat.vpos = intVal.value;
+      else if (field === 9) chat.anonymous = Boolean(intVal.value);
+      continue;
+    }
+    break;
+  }
+  return chat;
+}
+
+function decodeReconnect(buf) {
+  let pos = 0;
+  const data = {};
+  while (pos < buf.length) {
+    const tag = readVarint(buf, pos);
+    if (!tag) break;
+    pos += tag.length;
+    const field = tag.value >> 3;
+    const wire = tag.value & 0x7;
+    if (wire === 0) {
+      const intVal = readVarint(buf, pos);
+      if (!intVal) break;
+      pos += intVal.length;
+      if (field === 1) data.at = intVal.value;
+      continue;
+    }
+    if (wire === 2) {
+      const strVal = decodeString(buf, pos);
+      if (!strVal) break;
+      pos += strVal.bytesRead;
+      if (field === 2) data.streamUrl = strVal.value;
+      continue;
+    }
+    break;
+  }
+  return data;
+}
+
+function decodeError(buf) {
+  let pos = 0;
+  const data = {};
+  while (pos < buf.length) {
+    const tag = readVarint(buf, pos);
+    if (!tag) break;
+    pos += tag.length;
+    const field = tag.value >> 3;
+    const wire = tag.value & 0x7;
+    if (wire === 2) {
+      const strVal = decodeString(buf, pos);
+      if (!strVal) break;
+      pos += strVal.bytesRead;
+      if (field === 1) data.code = strVal.value;
+      else if (field === 2) data.message = strVal.value;
+      continue;
+    }
+    break;
+  }
+  return data;
+}
+
+function decodeRoom(buf) {
+  let pos = 0;
+  const data = {};
+  while (pos < buf.length) {
+    const tag = readVarint(buf, pos);
+    if (!tag) break;
+    pos += tag.length;
+    const field = tag.value >> 3;
+    const wire = tag.value & 0x7;
+    if (wire === 2) {
+      if (field === 4) {
+        const nested = readLengthDelimited(buf, pos);
+        if (!nested) break;
+        pos += nested.bytesRead;
+        const decoded = decodeRoom(nested.value);
+        data.messageServer = decoded;
+        continue;
+      }
+      const strVal = decodeString(buf, pos);
+      if (!strVal) break;
+      pos += strVal.bytesRead;
+      if (field === 1) data.name = strVal.value;
+      else if (field === 2) data.messageServerUrl = strVal.value;
+      else if (field === 3) data.threadId = strVal.value;
+      else if (field === 1) data.url = strVal.value;
+      continue;
+    }
+    break;
+  }
+  return data;
+}
+
+function decodeNdgrMessage(buf) {
+  let pos = 0;
+  const message = {};
+  while (pos < buf.length) {
+    const tagInfo = readVarint(buf, pos);
+    if (!tagInfo) break;
+    pos += tagInfo.length;
+    const field = tagInfo.value >> 3;
+    const wire = tagInfo.value & 0x7;
+    if (wire === 2) {
+      const ld = readLengthDelimited(buf, pos);
+      if (!ld) break;
+      pos += ld.bytesRead;
+      if (field === 2) message.room = decodeRoom(ld.value);
+      else if (field === 5) message.disconnect = { reason: ld.value.toString() };
+      else if (field === 6) message.reconnectAt = decodeReconnect(ld.value);
+      else if (field === 7) message.chat = decodeChatMessage(ld.value);
+      else if (field === 9) message.error = decodeError(ld.value);
+      continue;
+    }
+    if (wire === 0) {
+      const intVal = readVarint(buf, pos);
+      if (!intVal) break;
+      pos += intVal.length;
+      if (field === 1) message.serverTime = { currentMs: intVal.value };
+      else if (field === 3) message.seat = { id: String(intVal.value) };
+      else if (field === 4) message.ping = {};
+      continue;
+    }
+    break;
+  }
+  return message;
 }
 
 let win = null;
@@ -124,18 +314,23 @@ async function connectNiconico(liveUrlOrId) {
     return;
   }
 
+  let ndgrAbort = null;
+
   const connection = {
     id,
     type: "niconico",
     label: `ニコ生 ${liveId}`,
     status: "ニコ生に接続中…",
-    disconnect: null,
+    disconnect: async () => {
+      if (ndgrAbort) ndgrAbort.abort();
+    },
   };
 
   connections.set(id, connection);
   broadcastConnections();
 
   const watchUrl = `https://live.nicovideo.jp/watch/${liveId}`;
+  setStatus(`ニコ生 ${liveId} 接続準備 (step1: 視聴ページ取得開始)`);
 
   let html;
   try {
@@ -145,284 +340,217 @@ async function connectNiconico(liveUrlOrId) {
       },
     });
 
+    setStatus(
+      `ニコ生 ${liveId} 視聴ページ取得完了 (status: ${res.status}, step1)`
+    );
+
     if (!res.ok) {
-      setStatus(`ニコ生取得失敗 (${res.status})`);
       await disconnectConnection(id);
       return;
     }
 
     html = await res.text();
+    logNico("watch html length", html.length);
   } catch (e) {
     setStatus(`ニコ生取得失敗: ${e?.message || String(e)}`);
     await disconnectConnection(id);
     return;
   }
 
+  logNico("step2: data-props search");
   const propsMatch = html.match(/data-props="([^"]+)"/);
-  if (!propsMatch) {
-    logNico("data-props not found");
-    setStatus("ニコ生の情報が読み取れませんでした (data-props)");
+
+  let messageServerUrl = null;
+
+  if (propsMatch) {
+    try {
+      const decodedJson = decodeHtmlEntities(propsMatch[1]);
+      const props = JSON.parse(decodedJson);
+      logNico("data-props parse success");
+      const urlFromProps =
+        props?.program?.broadcast?.ndgr?.messageServer?.url ||
+        props?.program?.broadcast?.messageServer?.url ||
+        props?.program?.socialGroup?.messageServerUrl ||
+        props?.site?.program?.socialGroup?.messageServerUrl;
+      if (urlFromProps) messageServerUrl = urlFromProps;
+    } catch (e) {
+      logNico("data-props parse failed", e);
+    }
+  }
+
+  if (!messageServerUrl) {
+    const matchUrl = html.match(/https:\/\/mpn\.live\.nicovideo\.jp\/api\/view\/[^"'\s]+/i);
+    if (matchUrl) {
+      messageServerUrl = matchUrl[0];
+    }
+  }
+
+  if (!messageServerUrl) {
+    setStatus("NDGRのコメントサーバーURLが取得できませんでした (step2)");
     await disconnectConnection(id);
     return;
   }
 
-  logNico("data-props found");
+  setStatus(`step3: NDGR message server URL 取得: ${messageServerUrl}`);
 
-  let props;
-  try {
-    const decodedJson = decodeHtmlEntities(propsMatch[1]);
-    props = JSON.parse(decodedJson);
-    logNico("data-props parse success");
-  } catch (e) {
-    logNico("data-props parse failed", e);
-    setStatus(`ニコ生の情報パース失敗: ${e?.message || String(e)}`);
-    await disconnectConnection(id);
-    return;
-  }
+  const urlWithNow = messageServerUrl.includes("?")
+    ? `${messageServerUrl}&at=now`
+    : `${messageServerUrl}?at=now`;
 
-  const webSocketUrl =
-    props?.site?.watchSession?.webSocketUrl || props?.site?.relive?.webSocketUrl;
+  const abortController = new AbortController();
+  ndgrAbort = abortController;
 
-  if (!webSocketUrl) {
-    setStatus("ニコ生のwebSocketUrlが見つかりませんでした");
-    await disconnectConnection(id);
-    return;
-  }
-
-  const userId = props?.user?.id || "0";
-
-  let watchSocket = null;
-  let commentSocket = null;
-  let keepSeatTimer = null;
+  let reconnectTimer = null;
+  let messageCount = 0;
 
   const cleanup = () => {
-    if (watchSocket) {
-      try {
-        watchSocket.close();
-      } catch {}
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
     }
-    if (commentSocket) {
-      try {
-        commentSocket.close();
-      } catch {}
-    }
-    if (keepSeatTimer) {
-      clearInterval(keepSeatTimer);
-      keepSeatTimer = null;
-    }
-    watchSocket = null;
-    commentSocket = null;
+    abortController.abort();
   };
 
-  connection.disconnect = async () => {
-    cleanup();
-  };
+  connection.disconnect = async () => cleanup();
 
-  try {
-    watchSocket = new WebSocket(webSocketUrl);
-  } catch (e) {
-    setStatus(`ニコ生への接続開始失敗: ${e?.message || String(e)}`);
-    await disconnectConnection(id);
-    return;
-  }
-
-  updateConnectionStatus(id, "ニコ生: セッション開始中…");
-
-  watchSocket.onopen = () => {
-    try {
-      watchSocket.send(
-        JSON.stringify({
-          type: "startWatching",
-          data: {
-            stream: {
-              quality: "abr",
-              protocol: "hls",
-              latency: "low",
-              chasePlay: false,
-            },
-            room: {
-              protocol: "websocket",
-              commentable: true,
-            },
-            reconnect: false,
-          },
-        })
-      );
-      keepSeatTimer = setInterval(() => {
-        try {
-          watchSocket?.send?.(
-            JSON.stringify({
-              type: "keepSeat",
-            })
-          );
-        } catch {}
-      }, 60 * 1000);
-    } catch (e) {
-      setStatus(`ニコ生: startWatching送信失敗 ${e?.message || String(e)}`);
+  const decodeVarint = (buf, offset = 0) => {
+    let val = 0;
+    let shift = 0;
+    let pos = offset;
+    while (pos < buf.length) {
+      const b = buf[pos];
+      val |= (b & 0x7f) << shift;
+      pos += 1;
+      if ((b & 0x80) === 0) {
+        return { value: val, length: pos - offset };
+      }
+      shift += 7;
     }
+    return null;
   };
 
-  function startCommentSocket(messageServer) {
-    const commentUri =
-      messageServer?.uri || messageServer?.messageServerUri || messageServer?.url;
-    const threadId = String(messageServer?.threadId || messageServer?.thread_id || "");
-    const token =
-      messageServer?.accessToken || messageServer?.access_token || messageServer?.token;
+  const handleMessage = (msg) => {
+    if (!msg) return;
+    if (msg.ping) return;
+    if (msg.serverTime) return;
+    if (msg.statistics) return;
 
-    logNico("comment server info", {
-      commentUri,
-      threadId,
-      hasToken: Boolean(token),
-    });
-
-    if (!commentUri || !threadId) {
-      setStatus("ニコ生: コメントサーバー情報が不足しています");
+    if (msg.error) {
+      setStatus(`ニコ生エラー: ${msg.error.code || msg.error.message || "unknown"}`);
       return;
     }
 
-    try {
-      commentSocket = new WebSocket(commentUri, "msg.nicovideo.jp#json");
-    } catch (e) {
-      setStatus(`ニコ生: コメント接続失敗 ${e?.message || String(e)}`);
+    if (msg.disconnect) {
+      updateConnectionStatus(id, `切断: ${msg.disconnect.reason || "unknown"}`);
+      disconnectConnection(id);
       return;
     }
 
-    commentSocket.onopen = () => {
-      setStatus(`ニコ生: コメント接続完了 (${threadId})`);
-      logNico("comment socket open");
-      const payloads = [
-        { ping: { content: "rs:0" } },
-        {
-          thread: {
-            thread: threadId,
-            version: "20090904",
-            res_from: -150,
-            with_global: 1,
-            scores: 1,
-            user_id: String(userId),
-            ...(token ? { token } : {}),
-          },
+    if (msg.reconnectAt) {
+      const delay = Number(msg.reconnectAt.at || 0) - Date.now();
+      const waitMs = Number.isFinite(delay) && delay > 0 ? delay : 1000;
+      logNico("NDGR reconnectAt", msg.reconnectAt, "waitMs", waitMs);
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      reconnectTimer = setTimeout(() => {
+        connectStream(msg.reconnectAt.streamUrl || urlWithNow);
+      }, waitMs);
+      return;
+    }
+
+    if (msg.room) {
+      const roomInfo = msg.room.messageServer || msg.room;
+      const uri =
+        roomInfo.messageServerUrl || roomInfo.url || roomInfo.uri || messageServerUrl;
+      logNico("room message", roomInfo);
+      setStatus(`step4: NDGRストリーム接続開始 ${uri}`);
+      return;
+    }
+
+    if (msg.chat && msg.chat.content) {
+      messageCount += 1;
+      if (messageCount === 1) {
+        setStatus("step5: コメント受信開始 (1件目受信)");
+      }
+
+      send("message", {
+        connectionId: id,
+        source: connection.label,
+        user: msg.chat.name || msg.chat.userId || "niconico",
+        text: msg.chat.content,
+        badges: {},
+        emotes: null,
+      });
+      return;
+    }
+  };
+
+  const connectStream = async (targetUrl) => {
+    updateConnectionStatus(id, "NDGR コメントストリーム接続中…");
+    setStatus(`step4: ストリーム接続開始 ${targetUrl}`);
+    let response;
+    try {
+      response = await fetch(targetUrl, {
+        signal: abortController.signal,
+        headers: {
+          "User-Agent": "komebyu/1.0 (+https://github.com/)",
+          Accept: "application/octet-stream",
         },
-        { ping: { content: "rf:0" } },
-      ];
-      for (const p of payloads) {
-        try {
-          commentSocket.send(JSON.stringify(p));
-        } catch {}
-      }
-    };
-
-    commentSocket.onmessage = (event) => {
-      const raw = String(event.data || "");
-      logNico("comment socket message", raw.slice(0, 200));
-      const lines = String(event.data || "")
-        .split("\n")
-        .map((s) => s.trim())
-        .filter(Boolean);
-
-      for (const line of lines) {
-        let parsed;
-        try {
-          parsed = JSON.parse(line);
-        } catch {
-          continue;
-        }
-
-        if (parsed?.ping) continue;
-        if (parsed?.thread) continue;
-        const chat = parsed?.chat;
-        if (!chat?.content) continue;
-
-        send("message", {
-          connectionId: id,
-          source: connection.label,
-          user: chat.mail || chat.user_id || "niconico",
-          text: chat.content,
-          badges: {},
-          emotes: null,
-        });
-      }
-    };
-
-    commentSocket.onerror = (e) => {
-      logNico("comment socket error", e?.message || e);
-      setStatus(`ニコ生コメントエラー: ${e?.message || String(e)}`);
-    };
-
-    commentSocket.onclose = () => {
-      logNico("comment socket close");
-      updateConnectionStatus(id, "コメント切断");
-      disconnectConnection(id);
-    };
-  }
-
-  watchSocket.onmessage = (event) => {
-    let data;
-    try {
-      data = JSON.parse(event.data);
-    } catch {
+      });
+    } catch (e) {
+      if (abortController.signal.aborted) return;
+      setStatus(`NDGR接続失敗: ${e?.message || String(e)}`);
       return;
     }
 
-    logNico("watch message", { type: data.type, data: data.data });
+    logNico("NDGR stream status", response.status);
+    if (!response.ok || !response.body) {
+      setStatus(`NDGRストリーム取得失敗 (${response.status})`);
+      return;
+    }
 
-    if (data.type === "ping") {
+    const reader = response.body.getReader();
+    let buffer = Buffer.alloc(0);
+
+    updateConnectionStatus(id, "NDGR コメント受信中");
+
+    while (true) {
+      let chunk;
       try {
-        watchSocket.send(JSON.stringify({ type: "pong" }));
-      } catch {}
-      return;
-    }
-
-    if (data.type === "seat") {
-      updateConnectionStatus(id, "座席確保");
-      return;
-    }
-
-    if (data.type === "error") {
-      setStatus(`ニコ生エラー: ${data?.data?.code || "unknown"}`);
-      disconnectConnection(id);
-      return;
-    }
-
-    if (data.type === "room") {
-      const base = data.data || {};
-      const messageServer =
-        base.messageServer ||
-        base.room?.messageServer ||
-        base.room ||
-        base.messageServerInfo ||
-        base;
-      const threadId =
-        base.threadId ||
-        base.room?.threadId ||
-        base.messageServer?.threadId ||
-        base.room?.messageServer?.threadId;
-
-      if (!messageServer?.uri && !messageServer?.url && !messageServer?.messageServerUri) {
-        setStatus("ニコ生: コメントサーバー情報が見つかりませんでした");
-        return;
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunk = Buffer.from(value);
+      } catch (e) {
+        if (abortController.signal.aborted) break;
+        setStatus(`NDGR読込エラー: ${e?.message || String(e)}`);
+        break;
       }
 
+      if (chunk && chunk.length) buffer = Buffer.concat([buffer, chunk]);
 
-      startCommentSocket({ ...messageServer, threadId });
-      return;
+      while (buffer.length) {
+        const lengthInfo = decodeVarint(buffer, 0);
+        if (!lengthInfo) break;
+        const messageLength = lengthInfo.value;
+        const start = lengthInfo.length;
+        if (buffer.length < start + messageLength) break;
+
+        const messageBytes = buffer.slice(start, start + messageLength);
+        buffer = buffer.slice(start + messageLength);
+
+        const decoded = decodeNdgrMessage(messageBytes);
+        if (decoded && Object.keys(decoded).length) {
+          handleMessage(decoded);
+        }
+      }
     }
 
-    if (data.type === "disconnect") {
-      updateConnectionStatus(id, "切断");
-      disconnectConnection(id);
-      return;
+    if (!abortController.signal.aborted) {
+      setStatus("NDGRストリームが切断されました 再接続を試行します");
+      reconnectTimer = setTimeout(() => connectStream(targetUrl), 1500);
     }
   };
 
-  watchSocket.onerror = (e) => {
-    setStatus(`ニコ生エラー: ${e?.message || String(e)}`);
-  };
-
-  watchSocket.onclose = () => {
-    updateConnectionStatus(id, "切断");
-    disconnectConnection(id);
-  };
+  connectStream(urlWithNow);
 }
 
 async function connectTwitch(channelRaw) {
