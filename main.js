@@ -2,6 +2,27 @@ const { app, BrowserWindow, ipcMain } = require("electron");
 const path = require("path");
 const tmi = require("tmi.js");
 
+const NICO_DEBUG = process.env.NICO_DEBUG !== "false";
+
+function logNico(...args) {
+  if (!NICO_DEBUG) return;
+  console.log("[nico]", ...args);
+}
+
+function decodeHtmlEntities(text) {
+  if (!text) return "";
+  return String(text)
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&")
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, hex) =>
+      String.fromCodePoint(parseInt(hex, 16) || 0)
+    )
+    .replace(/&#(\d+);/g, (_, num) => String.fromCodePoint(parseInt(num, 10) || 0));
+}
+
 let win = null;
 const connections = new Map();
 
@@ -139,18 +160,21 @@ async function connectNiconico(liveUrlOrId) {
 
   const propsMatch = html.match(/data-props="([^"]+)"/);
   if (!propsMatch) {
+    logNico("data-props not found");
     setStatus("ニコ生の情報が読み取れませんでした (data-props)");
     await disconnectConnection(id);
     return;
   }
 
+  logNico("data-props found");
+
   let props;
   try {
-    const jsonText = propsMatch[1]
-      .replace(/&quot;/g, '"')
-      .replace(/&amp;/g, "&");
-    props = JSON.parse(jsonText);
+    const decodedJson = decodeHtmlEntities(propsMatch[1]);
+    props = JSON.parse(decodedJson);
+    logNico("data-props parse success");
   } catch (e) {
+    logNico("data-props parse failed", e);
     setStatus(`ニコ生の情報パース失敗: ${e?.message || String(e)}`);
     await disconnectConnection(id);
     return;
@@ -245,20 +269,27 @@ async function connectNiconico(liveUrlOrId) {
     const token =
       messageServer?.accessToken || messageServer?.access_token || messageServer?.token;
 
+    logNico("comment server info", {
+      commentUri,
+      threadId,
+      hasToken: Boolean(token),
+    });
+
     if (!commentUri || !threadId) {
       setStatus("ニコ生: コメントサーバー情報が不足しています");
       return;
     }
 
     try {
-      nicoCommentSocket = new WebSocket(commentUri, "msg.nicovideo.jp#json");
+      commentSocket = new WebSocket(commentUri, "msg.nicovideo.jp#json");
     } catch (e) {
       setStatus(`ニコ生: コメント接続失敗 ${e?.message || String(e)}`);
       return;
     }
 
-    nicoCommentSocket.onopen = () => {
+    commentSocket.onopen = () => {
       setStatus(`ニコ生: コメント接続完了 (${threadId})`);
+      logNico("comment socket open");
       const payloads = [
         { ping: { content: "rs:0" } },
         {
@@ -282,6 +313,8 @@ async function connectNiconico(liveUrlOrId) {
     };
 
     commentSocket.onmessage = (event) => {
+      const raw = String(event.data || "");
+      logNico("comment socket message", raw.slice(0, 200));
       const lines = String(event.data || "")
         .split("\n")
         .map((s) => s.trim())
@@ -312,10 +345,12 @@ async function connectNiconico(liveUrlOrId) {
     };
 
     commentSocket.onerror = (e) => {
+      logNico("comment socket error", e?.message || e);
       setStatus(`ニコ生コメントエラー: ${e?.message || String(e)}`);
     };
 
     commentSocket.onclose = () => {
+      logNico("comment socket close");
       updateConnectionStatus(id, "コメント切断");
       disconnectConnection(id);
     };
@@ -328,6 +363,8 @@ async function connectNiconico(liveUrlOrId) {
     } catch {
       return;
     }
+
+    logNico("watch message", { type: data.type, data: data.data });
 
     if (data.type === "ping") {
       try {
