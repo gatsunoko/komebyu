@@ -50,6 +50,32 @@ function decodeHtmlEntities(text) {
   });
 }
 
+function collectUrlsDeep(value, results = new Set(), seen = new Set()) {
+  if (value == null) return results;
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (/^(https?:|wss?:|ws:)/i.test(trimmed)) {
+      results.add(trimmed);
+    }
+    return results;
+  }
+
+  if (typeof value !== "object") return results;
+  if (seen.has(value)) return results;
+  seen.add(value);
+
+  if (Array.isArray(value)) {
+    for (const item of value) collectUrlsDeep(item, results, seen);
+    return results;
+  }
+
+  for (const key of Object.keys(value)) {
+    collectUrlsDeep(value[key], results, seen);
+  }
+
+  return results;
+}
+
 function readVarint(buf, offset = 0) {
   let val = 0n;
   let shift = 0n;
@@ -734,9 +760,12 @@ async function connectNiconico(liveUrlOrId) {
       try {
         parsed = JSON.parse(text);
       } catch (e) {
-        logNico("watch ws json parse failed", e, text.slice(0, 200));
+        logNico("watch ws json parse failed", e, text.slice(0, 2000));
         return;
       }
+
+      logNico("watch ws raw", text.slice(0, 2000));
+      logNico("watch ws parsed keys", Object.keys(parsed || {}));
 
       if (parsed.type === "ping") {
         try {
@@ -763,12 +792,35 @@ async function connectNiconico(liveUrlOrId) {
         parsed?.akashicMessageServer?.viewUri ||
         parsed?.room?.akashicMessageServer?.viewUri;
 
-      const preferredUri = akashicUri || candidateUri;
-      const sourceType = akashicUri ? "akashic" : candidateUri ? "message" : "unknown";
+      const urlCandidates = Array.from(collectUrlsDeep(parsed));
+      if (urlCandidates.length) {
+        logNico("watch ws url candidates", urlCandidates);
+      }
 
-        if (preferredUri) {
-          const preview = text.slice(0, 200);
-          setStatus(`step2c: watch ws recv ${sourceType}Server ${preview}`);
+      const segmentCandidate = urlCandidates.find((u) =>
+        u.includes("mpn.live.nicovideo.jp/data/segment/")
+      );
+      const viewCandidate =
+        urlCandidates.find((u) => u.includes("mpn.live.nicovideo.jp/api/view/")) ||
+        candidateUri;
+
+      if (segmentCandidate) {
+        const nextUri = ensureAtParam(segmentCandidate, "now");
+        logNico("segment uri (watch)", nextUri);
+        setStatus("step4: コメント取得開始");
+        connectSegmentStream(nextUri);
+      }
+
+      const preferredUri = akashicUri || viewCandidate;
+      const sourceType = akashicUri
+        ? "akashic"
+        : viewCandidate
+          ? "message"
+          : "unknown";
+
+      if (preferredUri) {
+        const preview = text.slice(0, 200);
+        setStatus(`step2c: watch ws recv ${sourceType}Server ${preview}`);
 
           if (preferredUri.includes("mpn.live.nicovideo.jp/api/view")) {
             if (viewUri !== preferredUri) {
