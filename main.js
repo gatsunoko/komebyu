@@ -2,6 +2,7 @@ const { app, BrowserWindow, ipcMain } = require("electron");
 const path = require("path");
 const tmi = require("tmi.js");
 const WebSocket = require("ws");
+const { decodeNdgrPayload, extractStreamMetaFromDecoded } = require("./proto/ndgr");
 
 const NICO_DEBUG = process.env.NICO_DEBUG !== "false";
 
@@ -199,37 +200,7 @@ function decodeRoom(buf) {
 }
 
 function decodeNdgrMessage(buf) {
-  let pos = 0;
-  const message = {};
-  while (pos < buf.length) {
-    const tagInfo = readVarint(buf, pos);
-    if (!tagInfo) break;
-    pos += tagInfo.length;
-    const field = tagInfo.value >> 3;
-    const wire = tagInfo.value & 0x7;
-    if (wire === 2) {
-      const ld = readLengthDelimited(buf, pos);
-      if (!ld) break;
-      pos += ld.bytesRead;
-      if (field === 2) message.room = decodeRoom(ld.value);
-      else if (field === 5) message.disconnect = { reason: ld.value.toString() };
-      else if (field === 6) message.reconnectAt = decodeReconnect(ld.value);
-      else if (field === 7) message.chat = decodeChatMessage(ld.value);
-      else if (field === 9) message.error = decodeError(ld.value);
-      continue;
-    }
-    if (wire === 0) {
-      const intVal = readVarint(buf, pos);
-      if (!intVal) break;
-      pos += intVal.length;
-      if (field === 1) message.serverTime = { currentMs: intVal.value };
-      else if (field === 3) message.seat = { id: String(intVal.value) };
-      else if (field === 4) message.ping = {};
-      continue;
-    }
-    break;
-  }
-  return message;
+  return decodeNdgrPayload(buf);
 }
 
 let win = null;
@@ -437,7 +408,7 @@ async function connectNiconico(liveUrlOrId) {
     let currentStreamPromise = null;
     let ndgrReconnectDelay = 1000;
     let viewUri = null;
-    let nextStreamAt = "now";
+    let nextStreamAt = null;
     let segmentUrl = null;
     let segmentAbort = null;
     let segmentPromise = null;
@@ -490,78 +461,10 @@ async function connectNiconico(liveUrlOrId) {
     }
   };
 
-  const toWireInfo = (tagValue) => {
-    if (typeof tagValue === "bigint") {
-      return { field: Number(tagValue >> 3n), wire: Number(tagValue & 0x7n) };
-    }
-    return { field: tagValue >> 3, wire: tagValue & 0x7 };
-  };
-
-  const traverseProto = (buf, visitor, depth = 0) => {
-    let pos = 0;
-    while (pos < buf.length) {
-      const tagInfo = readVarint(buf, pos);
-      if (!tagInfo) break;
-      pos += tagInfo.length;
-      const { field, wire } = toWireInfo(tagInfo.value);
-
-      if (wire === 0) {
-        const valInfo = readVarint(buf, pos);
-        if (!valInfo) break;
-        pos += valInfo.length;
-        visitor({ field, wire, value: valInfo.value, depth });
-        continue;
-      }
-
-      if (wire === 2) {
-        const ld = readLengthDelimited(buf, pos);
-        if (!ld) break;
-        pos += ld.bytesRead;
-        visitor({ field, wire, value: ld.value, depth });
-        traverseProto(ld.value, visitor, depth + 1);
-        continue;
-      }
-
-      break;
-    }
-  };
-
-  const safeTextFromBuffer = (buf) => {
-    if (!buf || !buf.length) return null;
-    try {
-      const text = Buffer.from(buf).toString("utf8");
-      return text.includes("\uFFFD") ? null : text;
-    } catch {
-      return null;
-    }
-  };
-
   const extractStreamMeta = (buf) => {
-    const meta = { nextStreamAt: null, segmentUris: [] };
-    const segmentRegex = /https?:\/\/mpn\.live\.nicovideo\.jp\/data\/segment\/v4\/[^\s"']+/g;
-
-    traverseProto(buf, ({ wire, value }) => {
-      if (wire === 0) {
-        const num = typeof value === "bigint" ? Number(value) : value;
-        if (Number.isSafeInteger(num) && num > 1_000_000_000_000) {
-          meta.nextStreamAt = num;
-        }
-        return;
-      }
-
-      if (wire === 2) {
-        const text = safeTextFromBuffer(value);
-        if (text) {
-          let match;
-          while ((match = segmentRegex.exec(text))) {
-            if (!meta.segmentUris.includes(match[0])) {
-              meta.segmentUris.push(match[0]);
-            }
-          }
-        }
-      }
-    });
-
+    const decoded = decodeNdgrMessage(buf);
+    const meta = extractStreamMetaFromDecoded(decoded, buf);
+    logNico("ndgr decoded meta", meta);
     return meta;
   };
 
@@ -641,7 +544,10 @@ async function connectNiconico(liveUrlOrId) {
             buffer = buffer.slice(headerOffset + messageLength);
 
             if (!firstChunkLogged) {
-              logNico("segment chunk0", rawChunk.toString("hex"));
+              logNico("segment chunk0", {
+                hex: rawChunk.toString("hex"),
+                length: rawChunk.length,
+              });
               firstChunkLogged = true;
             }
 
@@ -870,7 +776,10 @@ async function connectNiconico(liveUrlOrId) {
               buffer = buffer.slice(start + messageLength);
 
               if (!firstChunkLogged) {
-                logNico("messageServer chunk0", rawChunk.toString("hex"));
+                logNico("messageServer chunk0", {
+                  hex: rawChunk.toString("hex"),
+                  length: rawChunk.length,
+                });
                 firstChunkLogged = true;
               }
 
@@ -883,6 +792,7 @@ async function connectNiconico(liveUrlOrId) {
                   setStatus(`nextStreamAt = ${nextStreamAt}`);
                 }
                 if (meta.segmentUris.length) {
+                  logNico("segment URIs from meta", meta.segmentUris);
                   const nextSegment = meta.segmentUris[0];
                   if (nextSegment && nextSegment !== segmentUrl) {
                     connectSegmentStream(nextSegment);
@@ -934,21 +844,25 @@ async function connectNiconico(liveUrlOrId) {
         ndgrAbort = null;
 
         if (!connectionAbortController.signal.aborted && reason !== "abort") {
+          if (totalBytes <= 16 && !nextStreamAt) {
+            nextStreamAt = Date.now() + 2000;
+          }
           if (totalBytes <= 16) {
             logNico("NDGR stream ended quickly", { reason, totalBytes });
           }
 
-          const nextUrl = ensureAtParam(viewUri || targetUrl, nextStreamAt || "now");
+          const atValue = nextStreamAt ?? Date.now() + 2000;
+          const nextUrl = ensureAtParam(viewUri || targetUrl, atValue);
           setStatus(
             `NDGRストリームが切断されました 再接続を試行します (${reason})`
           );
           reconnectTimer = setTimeout(() => connectStream(nextUrl), ndgrReconnectDelay);
-          ndgrReconnectDelay = Math.min(ndgrReconnectDelay * 2, 4000);
+          ndgrReconnectDelay = Math.min(ndgrReconnectDelay * 2, 30000);
         } else {
           ndgrReconnectDelay = 1000;
         }
 
-        logNico("NDGR reconnect reason", reason, "totalBytes", totalBytes);
+        logNico("NDGR reconnect reason", reason, "totalBytes", totalBytes, "nextAt", nextStreamAt);
       }
     };
 
@@ -982,17 +896,24 @@ async function connectNiconico(liveUrlOrId) {
         parsed?.messageServer?.uri ||
         parsed?.room?.messageServer?.uri ||
         parsed?.room?.viewUri;
+      const akashicUri =
+        parsed?.data?.akashicMessageServer?.viewUri ||
+        parsed?.akashicMessageServer?.viewUri ||
+        parsed?.room?.akashicMessageServer?.viewUri;
 
-      if (candidateUri) {
+      const preferredUri = akashicUri || candidateUri;
+      const sourceType = akashicUri ? "akashic" : candidateUri ? "message" : "unknown";
+
+      if (preferredUri) {
         const preview = text.slice(0, 200);
-        setStatus(`step2c: watch ws recv messageServer ${preview}`);
+        setStatus(`step2c: watch ws recv ${sourceType}Server ${preview}`);
 
-        if (candidateUri.includes("mpn.live.nicovideo.jp/api/view")) {
-          if (viewUri !== candidateUri || !currentStreamUrl) {
-            viewUri = candidateUri;
-            nextStreamAt = "now";
-            setStatus(`step3: ndgr viewUri = ${viewUri}`);
-            connectStream(ensureAtParam(viewUri, nextStreamAt));
+        if (preferredUri.includes("mpn.live.nicovideo.jp/api/view")) {
+          if (viewUri !== preferredUri || !currentStreamUrl) {
+            viewUri = preferredUri;
+            nextStreamAt = null;
+            setStatus(`step3: ndgr viewUri (${sourceType}) = ${viewUri}`);
+            connectStream(ensureAtParam(viewUri, "now"));
           }
         }
       }
