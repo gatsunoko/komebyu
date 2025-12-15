@@ -1,0 +1,12 @@
+{
+  "name": "komebyu",
+  "version": "1.0.0",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "dependencies": {
+    "electron": "^39.2.7",
+    "tmi.js": "^1.8.5"
+  }
+}

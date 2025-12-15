@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self' 'unsafe-inline' 'unsafe-eval';">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Twitch コメビュ</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <header>
+      <div class="row">
+        <input id="channel" placeholder="チャンネル名（例: shroud）" />
+        <button id="connect">接続</button>
+        <button id="disconnect">切断</button>
+      </div>
+      <div class="row">
+        <div id="status">未接続</div>
+        <button id="clear" class="secondary">クリア</button>
+      </div>
+    </header>
+
+    <main>
+      <div class="panel">
+        <div class="panel-title">NGワード（1行=1ワード / ユーザー名 or 本文に含まれたら非表示）</div>
+        <textarea id="ng" placeholder="例:\nspam\nbot\nURL"></textarea>
+      </div>
+
+      <div class="panel">
+        <div class="panel-title">コメント</div>
+        <div id="list"></div>
+      </div>
+    </main>
+
+    <script src="renderer.js"></script>
+  </body>
+</html>

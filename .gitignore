@@ -1,0 +1,42 @@
+# ===== Node.js =====
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ===== Electron =====
+dist/
+out/
+release/
+build/
+
+# Electron Builder
+*.exe
+*.dmg
+*.AppImage
+*.zip
+*.tar.gz
+
+# ===== Logs =====
+logs/
+*.log
+
+# ===== OS =====
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ===== Editor =====
+.vscode/
+.idea/
+*.swp
+
+# ===== Env =====
+.env
+.env.local
+.env.*.local
+
+# ===== Cache =====
+.cache/
+.tmp/
