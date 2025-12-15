@@ -372,13 +372,23 @@ async function connectNiconico(liveUrlOrId) {
   }
 
     logNico("step2: watch websocket url search");
-    const propsMatch = html.match(/data-props="([^"]+)"/);
+
+      const findProps = () => {
+      const embeddedMatch = html.match(
+        /<script[^>]*id="embedded-data"[^>]*data-props="([^"]+)"/i
+      );
+      if (embeddedMatch) return embeddedMatch[1];
+      const genericMatch = html.match(/data-props="([^"]+)"/i);
+      if (genericMatch) return genericMatch[1];
+      return null;
+    };
 
     let watchWsUrl = null;
 
-    if (propsMatch) {
+    const rawProps = findProps();
+    if (rawProps) {
       try {
-        const decodedJson = decodeHtmlEntities(propsMatch[1]);
+        const decodedJson = decodeHtmlEntities(rawProps);
         const props = JSON.parse(decodedJson);
         logNico("data-props parse success");
         watchWsUrl =
@@ -393,10 +403,16 @@ async function connectNiconico(liveUrlOrId) {
     }
 
     if (!watchWsUrl) {
-      const matchUrl = html.match(/wss?:\/\/[^"'\s>]+watch[^"'\s<]*/i);
+      const matchUrl = html.match(/wss?:\/\/[\w./:%#@\-?=~_|!$&'()*+,;]+/i);
       if (matchUrl) {
         watchWsUrl = matchUrl[0];
       }
+    }
+
+    if (watchWsUrl) {
+      const cleaned = decodeHtmlEntities(String(watchWsUrl)).trim();
+      const match = cleaned.match(/wss?:\/\/[^"'<>\s]+/);
+      watchWsUrl = match ? match[0] : null;
     }
 
     if (!watchWsUrl) {
@@ -635,6 +651,10 @@ async function connectNiconico(liveUrlOrId) {
         } catch {}
         watchSocket = null;
       }
+
+      logNico("watch ws url len", String(watchWsUrl).length);
+      logNico("watch ws url head", String(watchWsUrl).slice(0, 200));
+      logNico("watch ws url tail", String(watchWsUrl).slice(-120));
 
       watchSocket = new WebSocket(watchWsUrl, {
         headers: { "User-Agent": "komebyu/1.0 (+https://github.com/)" },
