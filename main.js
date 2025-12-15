@@ -348,8 +348,25 @@ async function connectNiconico(liveUrlOrId) {
     }
 
     if (data.type === "room") {
-      const messageServer = data.data?.messageServer || data.data;
-      const threadId = data.data?.threadId;
+      const base = data.data || {};
+      const messageServer =
+        base.messageServer ||
+        base.room?.messageServer ||
+        base.room ||
+        base.messageServerInfo ||
+        base;
+      const threadId =
+        base.threadId ||
+        base.room?.threadId ||
+        base.messageServer?.threadId ||
+        base.room?.messageServer?.threadId;
+
+      if (!messageServer?.uri && !messageServer?.url && !messageServer?.messageServerUri) {
+        setStatus("ニコ生: コメントサーバー情報が見つかりませんでした");
+        return;
+      }
+
+
       startCommentSocket({ ...messageServer, threadId });
       return;
     }
