@@ -221,22 +221,26 @@ async function connectNiconico(liveUrlOrId) {
   };
 
   function startCommentSocket(messageServer) {
-    if (!messageServer?.uri || !messageServer?.threadId) {
+    const commentUri =
+      messageServer?.uri || messageServer?.messageServerUri || messageServer?.url;
+    const threadId = String(messageServer?.threadId || messageServer?.thread_id || "");
+    const token =
+      messageServer?.accessToken || messageServer?.access_token || messageServer?.token;
+
+    if (!commentUri || !threadId) {
       setStatus("ニコ生: コメントサーバー情報が不足しています");
       return;
     }
 
     try {
-      commentSocket = new WebSocket(messageServer.uri, "msg.nicovideo.jp#json");
+      nicoCommentSocket = new WebSocket(commentUri, "msg.nicovideo.jp#json");
     } catch (e) {
       setStatus(`ニコ生: コメント接続失敗 ${e?.message || String(e)}`);
       return;
     }
 
-    const threadId = String(messageServer.threadId);
-
-    commentSocket.onopen = () => {
-      updateConnectionStatus(id, `コメント接続完了 (${threadId})`);
+    nicoCommentSocket.onopen = () => {
+      setStatus(`ニコ生: コメント接続完了 (${threadId})`);
       const payloads = [
         { ping: { content: "rs:0" } },
         {
@@ -247,6 +251,7 @@ async function connectNiconico(liveUrlOrId) {
             with_global: 1,
             scores: 1,
             user_id: String(userId),
+            ...(token ? { token } : {}),
           },
         },
         { ping: { content: "rf:0" } },
