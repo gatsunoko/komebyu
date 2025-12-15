@@ -5,12 +5,21 @@ window.addEventListener("DOMContentLoaded", () => {
     disconnect: document.getElementById("disconnect"),
     status: document.getElementById("status"),
     list: document.getElementById("list"),
+    connections: document.getElementById("connections"),
     ng: document.getElementById("ng"),
     clear: document.getElementById("clear"),
   };
 
-  function setStatus(text) {
-    el.status.textContent = text;
+  function setStatus(payload) {
+    if (!payload) return;
+    if (typeof payload === "string") {
+      el.status.textContent = payload;
+      return;
+    }
+
+    if (payload.global) {
+      el.status.textContent = payload.global;
+    }
   }
 
   function buildMessageContent(text, emotes) {
@@ -61,7 +70,7 @@ window.addEventListener("DOMContentLoaded", () => {
     return fragment;
   }
 
-  function appendMessage({ user, text, badges, emotes }) {
+  function appendMessage({ user, text, badges, emotes, source }) {
     const ngWords = (el.ng.value || "")
       .split("\n")
       .map((s) => s.trim())
@@ -71,6 +80,10 @@ window.addEventListener("DOMContentLoaded", () => {
 
     const item = document.createElement("div");
     item.className = "msg";
+
+    const from = document.createElement("span");
+    from.className = "source";
+    from.textContent = source || "unknown";
 
     const name = document.createElement("span");
     name.className = "name";
@@ -85,6 +98,7 @@ window.addEventListener("DOMContentLoaded", () => {
     if (badges?.moderator) item.classList.add("moderator");
     if (badges?.subscriber) item.classList.add("subscriber");
 
+    item.appendChild(from);
     item.appendChild(name);
     item.appendChild(body);
 
@@ -93,6 +107,48 @@ window.addEventListener("DOMContentLoaded", () => {
 
     const max = 500;
     while (el.list.children.length > max) el.list.removeChild(el.list.firstChild);
+  }
+
+  function renderConnections(list) {
+    el.connections.innerHTML = "";
+
+    if (!Array.isArray(list) || list.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "connection-status";
+      empty.textContent = "接続なし";
+      el.connections.appendChild(empty);
+      return;
+    }
+
+    for (const conn of list) {
+      const row = document.createElement("div");
+      row.className = "connection-row";
+
+      const info = document.createElement("div");
+      info.className = "connection-info";
+
+      const label = document.createElement("div");
+      label.className = "connection-label";
+      label.textContent = conn.label;
+
+      const status = document.createElement("div");
+      status.className = "connection-status";
+      status.textContent = conn.status || "接続中";
+
+      info.appendChild(label);
+      info.appendChild(status);
+
+      const disconnect = document.createElement("button");
+      disconnect.className = "secondary";
+      disconnect.textContent = "切断";
+      disconnect.addEventListener("click", () => {
+        window.twitch.disconnect(conn.id);
+      });
+
+      row.appendChild(info);
+      row.appendChild(disconnect);
+      el.connections.appendChild(row);
+    }
   }
 
   el.connect.addEventListener("click", () => {
@@ -108,7 +164,9 @@ window.addEventListener("DOMContentLoaded", () => {
   window.twitch.onEvent(({ type, payload }) => {
     if (type === "status") setStatus(payload);
     if (type === "message") appendMessage(payload);
+    if (type === "connections") renderConnections(payload);
   });
 
   setStatus("未接続");
+  renderConnections([]);
 });
