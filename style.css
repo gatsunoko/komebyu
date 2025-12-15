@@ -84,3 +84,8 @@ main { padding: 12px; display: flex; flex-direction: column; gap: 12px; }
 .msg.broadcaster .name { text-decoration: underline; }
 .msg.moderator .name { opacity: 0.95; }
 .msg.subscriber .name { opacity: 0.95; }
+
+.emote {
+  height: 26px;
+  vertical-align: middle;
+}
