@@ -2,8 +2,7 @@ const { app, BrowserWindow, ipcMain } = require("electron");
 const path = require("path");
 const tmi = require("tmi.js");
 const WebSocket = require("ws");
-const { decodeEntry, decodeEntryPayload } = require("./proto/messageServer");
-const { decodeChunkedMessage } = require("./proto/segmentServer");
+const { decodeViewPayload, decodeChunkedMessage } = require("./proto/nicolive");
 
 const NICO_DEBUG = process.env.NICO_DEBUG !== "false";
 
@@ -117,6 +116,24 @@ function normalizeAtSeconds(at) {
   } catch {
     return String(at);
   }
+}
+
+function parseAtValue(at) {
+  if (at == null || at === "now") return null;
+  try {
+    return BigInt(at);
+  } catch {
+    return null;
+  }
+}
+
+function shouldAdvanceAt(currentAt, candidateAt) {
+  const current = parseAtValue(currentAt);
+  const candidate = parseAtValue(candidateAt);
+
+  if (candidate == null) return current == null;
+  if (current == null) return true;
+  return candidate > current;
 }
 
 function createChunkProcessor(label, onPayload) {
@@ -599,17 +616,8 @@ async function connectNiconico(liveUrlOrId) {
               firstPayloadLogged = true;
             }
 
-            const decoded = decodeEntryPayload(payload);
-            let entries = Array.isArray(decoded?.entries) ? decoded.entries : [];
-
-            if (!entries.length) {
-              try {
-                const fallback = decodeEntry(payload);
-                if (fallback) entries = [fallback];
-              } catch (fallbackErr) {
-                logNico("view decode fallback failed", fallbackErr);
-              }
-            }
+            const decoded = decodeViewPayload(payload);
+            const entries = Array.isArray(decoded?.entries) ? decoded.entries : [];
 
             for (const entry of entries) {
               if (entry?.segment?.uri) {
@@ -620,29 +628,37 @@ async function connectNiconico(liveUrlOrId) {
 
               if (entry?.reconnect?.at != null) {
                 const normalized = normalizeAtSeconds(entry.reconnect.at) || atValue;
-                nextStreamAt = normalized;
-                updatedDuringStream = true;
-                logNico("view reconnect.at", normalized);
-                try {
-                  localAbort.abort();
-                } catch {}
-                break;
+                if (shouldAdvanceAt(atValue, normalized)) {
+                  nextStreamAt = normalized;
+                  updatedDuringStream = true;
+                  logNico("view reconnect.at", normalized);
+                  try {
+                    localAbort.abort();
+                  } catch {}
+                  break;
+                }
+
+                logNico("view reconnect.at ignored (past)", normalized);
               }
 
               if (entry?.next?.at != null) {
                 const normalized = normalizeAtSeconds(entry.next.at) || atValue;
-                nextStreamAt = normalized;
-                updatedDuringStream = true;
-                if (entry.next.uri) {
-                  targetBase = entry.next.uri;
-                  viewUri = entry.next.uri;
-                  logNico("view next.uri", targetBase);
+                if (shouldAdvanceAt(atValue, normalized)) {
+                  nextStreamAt = normalized;
+                  updatedDuringStream = true;
+                  if (entry.next.uri) {
+                    targetBase = entry.next.uri;
+                    viewUri = entry.next.uri;
+                    logNico("view next.uri", targetBase);
+                  }
+                  logNico("view next.at", normalized);
+                  try {
+                    localAbort.abort();
+                  } catch {}
+                  break;
                 }
-                logNico("view next.at", normalized);
-                try {
-                  localAbort.abort();
-                } catch {}
-                break;
+
+                logNico("view next.at ignored (past)", normalized);
               }
 
               if (entry?.reconnect?.streamUrl) {
@@ -654,6 +670,10 @@ async function connectNiconico(liveUrlOrId) {
                   cursor: entry.reconnect.cursor || lastSegmentCursor,
                   at,
                 });
+              }
+
+              if (entry?.previous) {
+                logNico("view previous ignored", entry.previous);
               }
             }
           } catch (e) {
