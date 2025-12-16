@@ -702,6 +702,16 @@ async function connectNiconico(liveUrlOrId) {
                 });
               }
 
+              if (entry?.backwardUri) {
+                const at = normalizeAtSeconds(entry?.segment?.from) || undefined;
+                startSegmentStream(entry.backwardUri, { at });
+              }
+
+              if (entry?.snapshotUri) {
+                const at = normalizeAtSeconds(entry?.segment?.from) || undefined;
+                startSegmentStream(entry.snapshotUri, { at });
+              }
+
               if (entry?.previous) {
                 logNico("view previous ignored", entry.previous);
               }
