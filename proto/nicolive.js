@@ -50,6 +50,16 @@ class Reader {
     return Buffer.from(slice).toString("utf8");
   }
 
+  bytes() {
+    const length = this.uint32();
+    const start = this.pos;
+    const end = start + length;
+    if (end > this.len) throw new Error("unexpected eof while reading bytes");
+    const slice = this.buf.subarray(start, end);
+    this.pos = end;
+    return Buffer.from(slice);
+  }
+
   bool() {
     return this.uint32() !== 0;
   }
@@ -69,6 +79,9 @@ class Reader {
         this.pos += length;
         break;
       }
+      case 4:
+        // Deprecated end group. Nothing to skip explicitly.
+        break;
       case 5:
         this.pos += 4;
         break;
@@ -87,24 +100,68 @@ const asNumber = (value) => {
   return value == null ? null : Number(value);
 };
 
+const decodeInt64Value = (reader, length) => {
+  const end = length === undefined ? reader.len : reader.pos + length;
+  let value = null;
+  while (reader.pos < end) {
+    const tag = reader.uint32();
+    switch (tag >>> 3) {
+      case 1:
+        value = reader.int64();
+        break;
+      default:
+        reader.skipType(tag & 7);
+        break;
+    }
+  }
+  return asNumber(value);
+};
+
+const readInt64Field = (reader, wireType) => {
+  if (wireType === 0) return asNumber(reader.int64());
+  if (wireType === 2) return decodeInt64Value(reader, reader.uint32());
+  reader.skipType(wireType);
+  return null;
+};
+
+const decodeOpaqueCursor = (buf) => {
+  try {
+    const text = buf.toString("utf8");
+    if (Buffer.from(text, "utf8").equals(buf)) {
+      return { cursor: text };
+    }
+  } catch {}
+
+  return { cursor: buf.toString("base64"), cursorBytes: buf };
+};
+
 // view/v4 messages -----------------------------------------------------------
 const decodeViewSegment = (reader, length) => {
   const end = length === undefined ? reader.len : reader.pos + length;
   const message = {};
   while (reader.pos < end) {
     const tag = reader.uint32();
-    switch (tag >>> 3) {
+    const field = tag >>> 3;
+    const wireType = tag & 7;
+    switch (field) {
       case 1:
-        message.uri = reader.string();
+        message.from = readInt64Field(reader, wireType);
         break;
       case 2:
-        message.from = asNumber(reader.int64());
+        message.until = readInt64Field(reader, wireType);
         break;
       case 3:
-        message.until = asNumber(reader.int64());
+        if (wireType === 2) {
+          message.uri = reader.string();
+        } else {
+          reader.skipType(wireType);
+        }
+        break;
+      case 4:
+        message.reconnectAt = readInt64Field(reader, wireType);
         break;
       default:
-        reader.skipType(tag & 7);
+        reader.skipType(wireType);
         break;
     }
   }
@@ -116,15 +173,30 @@ const decodeNext = (reader, length) => {
   const message = {};
   while (reader.pos < end) {
     const tag = reader.uint32();
-    switch (tag >>> 3) {
+    const field = tag >>> 3;
+    const wireType = tag & 7;
+    switch (field) {
       case 1:
-        message.at = asNumber(reader.int64());
+        message.at = readInt64Field(reader, wireType);
         break;
       case 2:
-        message.cursor = reader.string();
+        if (wireType === 2) {
+          const { cursor, cursorBytes } = decodeOpaqueCursor(reader.bytes());
+          message.cursor = cursor;
+          if (cursorBytes) message.cursorBytes = cursorBytes;
+        } else {
+          reader.skipType(wireType);
+        }
+        break;
+      case 3:
+        if (wireType === 2) {
+          message.uri = reader.string();
+        } else {
+          reader.skipType(wireType);
+        }
         break;
       default:
-        reader.skipType(tag & 7);
+        reader.skipType(wireType);
         break;
     }
   }
@@ -136,15 +208,30 @@ const decodePrevious = (reader, length) => {
   const message = {};
   while (reader.pos < end) {
     const tag = reader.uint32();
-    switch (tag >>> 3) {
+    const field = tag >>> 3;
+    const wireType = tag & 7;
+    switch (field) {
       case 1:
-        message.at = asNumber(reader.int64());
+        message.at = readInt64Field(reader, wireType);
         break;
       case 2:
-        message.cursor = reader.string();
+        if (wireType === 2) {
+          const { cursor, cursorBytes } = decodeOpaqueCursor(reader.bytes());
+          message.cursor = cursor;
+          if (cursorBytes) message.cursorBytes = cursorBytes;
+        } else {
+          reader.skipType(wireType);
+        }
+        break;
+      case 3:
+        if (wireType === 2) {
+          message.uri = reader.string();
+        } else {
+          reader.skipType(wireType);
+        }
         break;
       default:
-        reader.skipType(tag & 7);
+        reader.skipType(wireType);
         break;
     }
   }
@@ -156,18 +243,33 @@ const decodeReconnect = (reader, length) => {
   const message = {};
   while (reader.pos < end) {
     const tag = reader.uint32();
-    switch (tag >>> 3) {
+    const field = tag >>> 3;
+    const wireType = tag & 7;
+    switch (field) {
       case 1:
-        message.at = asNumber(reader.int64());
+        message.at = readInt64Field(reader, wireType);
         break;
       case 2:
-        message.streamUrl = reader.string();
+        if (wireType === 2) {
+          message.streamUrl = reader.string();
+        } else {
+          reader.skipType(wireType);
+        }
         break;
       case 3:
-        message.cursor = reader.string();
+        if (wireType === 2) {
+          const { cursor, cursorBytes } = decodeOpaqueCursor(reader.bytes());
+          message.cursor = cursor;
+          if (cursorBytes) message.cursorBytes = cursorBytes;
+        } else {
+          reader.skipType(wireType);
+        }
+        break;
+      case 4:
+        message.reconnectAt = readInt64Field(reader, wireType);
         break;
       default:
-        reader.skipType(tag & 7);
+        reader.skipType(wireType);
         break;
     }
   }
@@ -215,10 +317,10 @@ const decodeChunkedEntry = (buf) => {
       case 1:
         message.entries.push(decodeEntry(reader, reader.uint32()));
         break;
+      case 2:
+        message.entries.push(decodeEntry(reader, reader.uint32()));
+        break;
       default:
-        // Field #2 is used for backward/snapshot data on some servers and is
-        // not part of the entries array. Skip safely so the decoder does not
-        // attempt to parse it as an entry and hit EOF mid-string.
         reader.skipType(tag & 7);
         break;
     }
@@ -249,18 +351,33 @@ const decodeSegmentReconnect = (reader, length) => {
   const message = {};
   while (reader.pos < end) {
     const tag = reader.uint32();
-    switch (tag >>> 3) {
+    const field = tag >>> 3;
+    const wireType = tag & 7;
+    switch (field) {
       case 1:
-        message.at = asNumber(reader.int64());
+        message.at = readInt64Field(reader, wireType);
         break;
       case 2:
-        message.streamUrl = reader.string();
+        if (wireType === 2) {
+          message.streamUrl = reader.string();
+        } else {
+          reader.skipType(wireType);
+        }
         break;
       case 3:
-        message.cursor = reader.string();
+        if (wireType === 2) {
+          const { cursor, cursorBytes } = decodeOpaqueCursor(reader.bytes());
+          message.cursor = cursor;
+          if (cursorBytes) message.cursorBytes = cursorBytes;
+        } else {
+          reader.skipType(wireType);
+        }
+        break;
+      case 4:
+        message.reconnectAt = readInt64Field(reader, wireType);
         break;
       default:
-        reader.skipType(tag & 7);
+        reader.skipType(wireType);
         break;
     }
   }
