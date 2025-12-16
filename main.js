@@ -122,6 +122,14 @@ function readVarint(buf, offset = 0) {
   return null;
 }
 
+function safeUtf8(buffer) {
+  try {
+    const text = buffer.toString("utf8");
+    if (Buffer.from(text, "utf8").equals(buffer)) return text;
+  } catch {}
+  return null;
+}
+
 function normalizeAtSeconds(at) {
   if (at == null) return null;
   if (at === "now") return "now";
@@ -507,7 +515,32 @@ async function connectNiconico(liveUrlOrId) {
               firstPayloadLogged = true;
             }
 
-            const decoded = decodeChunkedMessage(payload);
+            const decodeWithFallback = (bytes) => {
+              try {
+                return decodeChunkedMessage(bytes);
+              } catch (e) {
+                const text = safeUtf8(Buffer.from(bytes));
+                if (!text) throw e;
+
+                const matches = text.match(/[A-Za-z0-9+/=]{8,}/g);
+                if (!matches) throw e;
+
+                const merged = [];
+                for (const token of matches) {
+                  try {
+                    const parsed = decodeChunkedMessage(Buffer.from(token, "base64"));
+                    if (Array.isArray(parsed?.messages) && parsed.messages.length) {
+                      merged.push(...parsed.messages);
+                    }
+                  } catch {}
+                }
+
+                if (merged.length) return { messages: merged };
+                throw e;
+              }
+            };
+
+            const decoded = decodeWithFallback(payload);
             const envelopes = Array.isArray(decoded?.messages)
               ? decoded.messages
               : decoded
