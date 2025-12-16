@@ -86,10 +86,26 @@ class Reader {
         this.pos += 4;
         break;
       default:
+        if (wireType === 3 || wireType === 6 || wireType === 7) {
+          // Groups (3) are deprecated but may still appear from malformed
+          // frames. Wire types 6/7 are invalid but we treat them as a signal
+          // to abandon the rest of this frame so that higher layers can keep
+          // processing subsequent frames.
+          this.pos = this.len;
+          break;
+        }
         throw new Error(`unsupported wire type ${wireType}`);
     }
   }
 }
+
+const safeToUtf8 = (buf) => {
+  try {
+    const text = buf.toString("utf8");
+    if (Buffer.from(text, "utf8").equals(buf)) return text;
+  } catch {}
+  return null;
+};
 
 const asNumber = (value) => {
   if (typeof value === "number") return value;
@@ -98,6 +114,84 @@ const asNumber = (value) => {
     return value;
   }
   return value == null ? null : Number(value);
+};
+
+const tryDecodeStringValue = (bytes) => {
+  try {
+    const reader = new Reader(bytes);
+    while (reader.pos < reader.len) {
+      const tag = reader.uint32();
+      const field = tag >>> 3;
+      const wireType = tag & 7;
+      if (field === 1 && wireType === 2) {
+        return reader.string();
+      }
+      reader.skipType(wireType);
+    }
+  } catch {}
+  return null;
+};
+
+const tryDecodeInt64Value = (bytes) => {
+  try {
+    const reader = new Reader(bytes);
+    const end = reader.len;
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      const field = tag >>> 3;
+      const wireType = tag & 7;
+      if (field === 1 && (wireType === 0 || wireType === 1 || wireType === 2)) {
+        if (wireType === 0) return asNumber(reader.uint64());
+        if (wireType === 1) {
+          // 64bit fixed
+          const start = reader.pos;
+          const endPos = start + 8;
+          if (endPos > reader.len) throw new Error("unexpected eof while reading fixed64");
+          const view = new DataView(reader.buf.buffer, reader.buf.byteOffset + start, 8);
+          reader.pos = endPos;
+          return Number(view.getBigUint64(0, true));
+        }
+        if (wireType === 2) {
+          const len = reader.uint32();
+          const nestedEnd = reader.pos + len;
+          if (nestedEnd > reader.len) throw new Error("unexpected eof while reading nested int64");
+          const nested = reader.buf.subarray(reader.pos, nestedEnd);
+          reader.pos = nestedEnd;
+          return tryDecodeInt64Value(Buffer.from(nested));
+        }
+      } else {
+        reader.skipType(wireType);
+      }
+    }
+  } catch {}
+
+  try {
+    const raw = new Reader(bytes);
+    const val = raw.uint64();
+    if (raw.pos === raw.len) return val;
+  } catch {}
+
+  return null;
+};
+
+const decodeStringFromBytes = (bytes) => {
+  const wrapped = tryDecodeStringValue(bytes);
+  if (wrapped != null) return wrapped;
+
+  const direct = safeToUtf8(bytes);
+  if (direct != null) return direct;
+
+  return null;
+};
+
+const readStringFlexible = (reader, wireType) => {
+  if (wireType !== 2) {
+    reader.skipType(wireType);
+    return null;
+  }
+
+  const bytes = reader.bytes();
+  return decodeStringFromBytes(bytes);
 };
 
 const decodeInt64Value = (reader, length) => {
@@ -119,7 +213,16 @@ const decodeInt64Value = (reader, length) => {
 
 const readInt64Field = (reader, wireType) => {
   if (wireType === 0) return asNumber(reader.int64());
-  if (wireType === 2) return decodeInt64Value(reader, reader.uint32());
+  if (wireType === 2) {
+    const len = reader.uint32();
+    const start = reader.pos;
+    const end = start + len;
+    if (end > reader.len) throw new Error("unexpected eof while reading int64 field");
+    const bytes = reader.buf.subarray(start, end);
+    reader.pos = end;
+    const decoded = tryDecodeInt64Value(Buffer.from(bytes));
+    return decoded != null ? decoded : null;
+  }
   reader.skipType(wireType);
   return null;
 };
@@ -151,11 +254,7 @@ const decodeViewSegment = (reader, length) => {
         message.until = readInt64Field(reader, wireType);
         break;
       case 3:
-        if (wireType === 2) {
-          message.uri = reader.string();
-        } else {
-          reader.skipType(wireType);
-        }
+        message.uri = readStringFlexible(reader, wireType);
         break;
       case 4:
         message.reconnectAt = readInt64Field(reader, wireType);
@@ -189,11 +288,7 @@ const decodeNext = (reader, length) => {
         }
         break;
       case 3:
-        if (wireType === 2) {
-          message.uri = reader.string();
-        } else {
-          reader.skipType(wireType);
-        }
+        message.uri = readStringFlexible(reader, wireType);
         break;
       default:
         reader.skipType(wireType);
@@ -250,11 +345,7 @@ const decodeReconnect = (reader, length) => {
         message.at = readInt64Field(reader, wireType);
         break;
       case 2:
-        if (wireType === 2) {
-          message.streamUrl = reader.string();
-        } else {
-          reader.skipType(wireType);
-        }
+        message.streamUrl = readStringFlexible(reader, wireType);
         break;
       case 3:
         if (wireType === 2) {
@@ -281,18 +372,68 @@ const decodeEntry = (reader, length) => {
   const message = {};
   while (reader.pos < end) {
     const tag = reader.uint32();
-    switch (tag >>> 3) {
+    const field = tag >>> 3;
+    const wireType = tag & 7;
+    switch (field) {
       case 1:
-        message.segment = decodeViewSegment(reader, reader.uint32());
+        if (wireType === 2) {
+          message.segment = decodeViewSegment(reader, reader.uint32());
+        } else {
+          reader.skipType(wireType);
+        }
         break;
       case 2:
-        message.next = decodeNext(reader, reader.uint32());
+        if (wireType === 2) {
+          const bytes = reader.bytes();
+          const str = decodeStringFromBytes(bytes);
+          if (str && /^https?:\/\//i.test(str)) {
+            message.backwardUri = str;
+          } else {
+            try {
+              const decoded = decodeNext(new Reader(bytes));
+              message.next = decoded;
+              if (decoded?.uri && /^https?:\/\//i.test(decoded.uri)) {
+                message.backwardUri = decoded.uri;
+              }
+            } catch (e) {
+              // keep decoding other fields in the same entry
+            }
+          }
+        } else {
+          reader.skipType(wireType);
+        }
         break;
       case 3:
-        message.previous = decodePrevious(reader, reader.uint32());
+        if (wireType === 2) {
+          const bytes = reader.bytes();
+          const str = decodeStringFromBytes(bytes);
+          if (str && /^https?:\/\//i.test(str)) {
+            message.snapshotUri = str;
+          } else {
+            try {
+              const decoded = decodePrevious(new Reader(bytes));
+              message.previous = decoded;
+              if (decoded?.uri && /^https?:\/\//i.test(decoded.uri)) {
+                message.snapshotUri = decoded.uri;
+              }
+            } catch (e) {
+              // continue decoding other fields
+            }
+          }
+        } else {
+          reader.skipType(wireType);
+        }
         break;
       case 4:
-        message.reconnect = decodeReconnect(reader, reader.uint32());
+        if (wireType === 2) {
+          try {
+            message.reconnect = decodeReconnect(new Reader(reader.bytes()));
+          } catch (e) {
+            // ignore errors for this frame
+          }
+        } else {
+          reader.skipType(wireType);
+        }
         break;
       case 5:
         message.ping = {};
@@ -301,7 +442,7 @@ const decodeEntry = (reader, length) => {
         message.history = {};
         break;
       default:
-        reader.skipType(tag & 7);
+        reader.skipType(wireType);
         break;
     }
   }
@@ -358,11 +499,7 @@ const decodeSegmentReconnect = (reader, length) => {
         message.at = readInt64Field(reader, wireType);
         break;
       case 2:
-        if (wireType === 2) {
-          message.streamUrl = reader.string();
-        } else {
-          reader.skipType(wireType);
-        }
+        message.streamUrl = readStringFlexible(reader, wireType);
         break;
       case 3:
         if (wireType === 2) {
@@ -491,10 +628,46 @@ const decodeChunkedMessage = (buf) => {
   return message;
 };
 
+// Best-effort chunked message decoder that keeps any messages parsed before an
+// error. Useful for tolerating malformed segment payloads that otherwise abort
+// decoding.
+const decodeChunkedMessageLoose = (buf) => {
+  const reader = buf instanceof Reader ? buf : new Reader(buf);
+  const message = { messages: [] };
+  while (reader.pos < reader.len) {
+    let tag;
+    try {
+      tag = reader.uint32();
+    } catch {
+      break;
+    }
+
+    const field = tag >>> 3;
+    const wireType = tag & 7;
+
+    if (field === 1 && wireType === 2) {
+      try {
+        const len = reader.uint32();
+        message.messages.push(decodeMessage(reader, len));
+      } catch {
+        break;
+      }
+    } else {
+      try {
+        reader.skipType(wireType);
+      } catch {
+        break;
+      }
+    }
+  }
+  return message;
+};
+
 module.exports = {
   Reader,
   decodeChunkedEntry,
   decodeEntry,
   decodeViewPayload,
   decodeChunkedMessage,
+  decodeChunkedMessageLoose,
 };

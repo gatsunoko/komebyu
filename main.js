@@ -2,7 +2,11 @@ const { app, BrowserWindow, ipcMain } = require("electron");
 const path = require("path");
 const tmi = require("tmi.js");
 const WebSocket = require("ws");
-const { decodeViewPayload, decodeChunkedMessage } = require("./proto/nicolive");
+const {
+  decodeViewPayload,
+  decodeChunkedMessage,
+  decodeChunkedMessageLoose,
+} = require("./proto/nicolive");
 
 const NICO_DEBUG = process.env.NICO_DEBUG !== "false";
 
@@ -119,6 +123,14 @@ function readVarint(buf, offset = 0) {
     }
     shift += 7n;
   }
+  return null;
+}
+
+function safeUtf8(buffer) {
+  try {
+    const text = buffer.toString("utf8");
+    if (Buffer.from(text, "utf8").equals(buffer)) return text;
+  } catch {}
   return null;
 }
 
@@ -507,7 +519,43 @@ async function connectNiconico(liveUrlOrId) {
               firstPayloadLogged = true;
             }
 
-            const decoded = decodeChunkedMessage(payload);
+            const decodeWithFallback = (bytes) => {
+              try {
+                return decodeChunkedMessage(bytes);
+              } catch (e) {
+                const tolerant = decodeChunkedMessageLoose(bytes);
+                if (Array.isArray(tolerant?.messages) && tolerant.messages.length) {
+                  return tolerant;
+                }
+
+                const text = safeUtf8(Buffer.from(bytes));
+                if (!text) throw e;
+
+                const tokens = [];
+                const compact = text.replace(/\s+/g, "");
+                if (/^[A-Za-z0-9+/=]+$/.test(compact) && compact.length >= 8) {
+                  tokens.push(compact);
+                }
+
+                const matches = text.match(/[A-Za-z0-9+/=]{8,}/g);
+                if (matches) tokens.push(...matches);
+
+                const merged = [];
+                for (const token of tokens) {
+                  try {
+                    const parsed = decodeChunkedMessageLoose(Buffer.from(token, "base64"));
+                    if (Array.isArray(parsed?.messages) && parsed.messages.length) {
+                      merged.push(...parsed.messages);
+                    }
+                  } catch {}
+                }
+
+                if (merged.length) return { messages: merged };
+                throw e;
+              }
+            };
+
+            const decoded = decodeWithFallback(payload);
             const envelopes = Array.isArray(decoded?.messages)
               ? decoded.messages
               : decoded
@@ -700,6 +748,16 @@ async function connectNiconico(liveUrlOrId) {
                   cursor: entry.reconnect.cursor || lastSegmentCursor,
                   at,
                 });
+              }
+
+              if (entry?.backwardUri) {
+                const at = normalizeAtSeconds(entry?.segment?.from) || undefined;
+                startSegmentStream(entry.backwardUri, { at });
+              }
+
+              if (entry?.snapshotUri) {
+                const at = normalizeAtSeconds(entry?.segment?.from) || undefined;
+                startSegmentStream(entry.snapshotUri, { at });
               }
 
               if (entry?.previous) {
