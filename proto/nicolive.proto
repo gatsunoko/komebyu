@@ -3,7 +3,10 @@ syntax = "proto3";
 package dwango.nicolive.chat.service.edge;
 
 message ChunkedEntry {
+  // Some NDGR servers emit entries using field #2 instead of #1.
+  // Keep both for compatibility with live (field #2) and legacy (field #1).
   repeated Entry entry = 1;
+  repeated Entry entries = 2;
 }
 
 message Entry {
