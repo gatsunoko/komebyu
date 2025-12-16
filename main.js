@@ -527,7 +527,6 @@ async function connectNiconico(liveUrlOrId) {
                 if (Array.isArray(tolerant?.messages) && tolerant.messages.length) {
                   return tolerant;
                 }
-
                 const text = safeUtf8(Buffer.from(bytes));
                 if (!text) throw e;
 
