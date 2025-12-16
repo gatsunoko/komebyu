@@ -86,6 +86,14 @@ class Reader {
         this.pos += 4;
         break;
       default:
+        if (wireType === 3 || wireType === 6 || wireType === 7) {
+          // Groups (3) are deprecated but may still appear from malformed
+          // frames. Wire types 6/7 are invalid but we treat them as a signal
+          // to abandon the rest of this frame so that higher layers can keep
+          // processing subsequent frames.
+          this.pos = this.len;
+          break;
+        }
         throw new Error(`unsupported wire type ${wireType}`);
     }
   }
@@ -620,10 +628,46 @@ const decodeChunkedMessage = (buf) => {
   return message;
 };
 
+// Best-effort chunked message decoder that keeps any messages parsed before an
+// error. Useful for tolerating malformed segment payloads that otherwise abort
+// decoding.
+const decodeChunkedMessageLoose = (buf) => {
+  const reader = buf instanceof Reader ? buf : new Reader(buf);
+  const message = { messages: [] };
+  while (reader.pos < reader.len) {
+    let tag;
+    try {
+      tag = reader.uint32();
+    } catch {
+      break;
+    }
+
+    const field = tag >>> 3;
+    const wireType = tag & 7;
+
+    if (field === 1 && wireType === 2) {
+      try {
+        const len = reader.uint32();
+        message.messages.push(decodeMessage(reader, len));
+      } catch {
+        break;
+      }
+    } else {
+      try {
+        reader.skipType(wireType);
+      } catch {
+        break;
+      }
+    }
+  }
+  return message;
+};
+
 module.exports = {
   Reader,
   decodeChunkedEntry,
   decodeEntry,
   decodeViewPayload,
   decodeChunkedMessage,
+  decodeChunkedMessageLoose,
 };

@@ -2,7 +2,11 @@ const { app, BrowserWindow, ipcMain } = require("electron");
 const path = require("path");
 const tmi = require("tmi.js");
 const WebSocket = require("ws");
-const { decodeViewPayload, decodeChunkedMessage } = require("./proto/nicolive");
+const {
+  decodeViewPayload,
+  decodeChunkedMessage,
+  decodeChunkedMessageLoose,
+} = require("./proto/nicolive");
 
 const NICO_DEBUG = process.env.NICO_DEBUG !== "false";
 
@@ -519,6 +523,10 @@ async function connectNiconico(liveUrlOrId) {
               try {
                 return decodeChunkedMessage(bytes);
               } catch (e) {
+                const tolerant = decodeChunkedMessageLoose(bytes);
+                if (Array.isArray(tolerant?.messages) && tolerant.messages.length) {
+                  return tolerant;
+                }
                 const text = safeUtf8(Buffer.from(bytes));
                 if (!text) throw e;
 
@@ -534,7 +542,7 @@ async function connectNiconico(liveUrlOrId) {
                 const merged = [];
                 for (const token of tokens) {
                   try {
-                    const parsed = decodeChunkedMessage(Buffer.from(token, "base64"));
+                    const parsed = decodeChunkedMessageLoose(Buffer.from(token, "base64"));
                     if (Array.isArray(parsed?.messages) && parsed.messages.length) {
                       merged.push(...parsed.messages);
                     }
