@@ -72,6 +72,36 @@ function collectUrlsDeep(value, results = new Set(), seen = new Set()) {
   return results;
 }
 
+function extractSegmentUrlFromPayload(payload) {
+  if (!payload?.length) return null;
+
+  try {
+    const text = Buffer.from(payload).toString("utf8");
+    const marker = "/data/segment/v4/";
+    const index = text.indexOf(marker);
+    if (index === -1) return null;
+
+    let start = index;
+    while (start > 0) {
+      const char = text[start - 1];
+      if (/\s|"|'|\u0000/.test(char)) break;
+      start -= 1;
+    }
+
+    let end = index + marker.length;
+    while (end < text.length) {
+      const char = text[end];
+      if (/\s|"|'|\u0000/.test(char)) break;
+      end += 1;
+    }
+
+    const candidate = text.slice(start, end);
+    if (/^https?:\/\//i.test(candidate)) return candidate;
+  } catch {}
+
+  return null;
+}
+
 function readVarint(buf, offset = 0) {
   let val = 0n;
   let shift = 0n;
@@ -684,6 +714,13 @@ async function connectNiconico(liveUrlOrId) {
               payloadHex: payload.slice(0, 32).toString("hex"),
               chunkHead: rawChunk.slice(0, 16).toString("hex"),
             });
+
+            const fallbackUrl = extractSegmentUrlFromPayload(payload);
+            if (fallbackUrl) {
+              const safeUrl = ensureAtParam(fallbackUrl, "now");
+              logNico("view decode fallback url", safeUrl);
+              startSegmentStream(safeUrl);
+            }
           }
         });
 

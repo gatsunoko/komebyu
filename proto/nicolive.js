@@ -213,10 +213,12 @@ const decodeChunkedEntry = (buf) => {
     const tag = reader.uint32();
     switch (tag >>> 3) {
       case 1:
-      case 2:
         message.entries.push(decodeEntry(reader, reader.uint32()));
         break;
       default:
+        // Field #2 is used for backward/snapshot data on some servers and is
+        // not part of the entries array. Skip safely so the decoder does not
+        // attempt to parse it as an entry and hit EOF mid-string.
         reader.skipType(tag & 7);
         break;
     }
