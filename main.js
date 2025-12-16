@@ -522,11 +522,17 @@ async function connectNiconico(liveUrlOrId) {
                 const text = safeUtf8(Buffer.from(bytes));
                 if (!text) throw e;
 
+                const tokens = [];
+                const compact = text.replace(/\s+/g, "");
+                if (/^[A-Za-z0-9+/=]+$/.test(compact) && compact.length >= 8) {
+                  tokens.push(compact);
+                }
+
                 const matches = text.match(/[A-Za-z0-9+/=]{8,}/g);
-                if (!matches) throw e;
+                if (matches) tokens.push(...matches);
 
                 const merged = [];
-                for (const token of matches) {
+                for (const token of tokens) {
                   try {
                     const parsed = decodeChunkedMessage(Buffer.from(token, "base64"));
                     if (Array.isArray(parsed?.messages) && parsed.messages.length) {
