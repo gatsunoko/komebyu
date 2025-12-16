@@ -93,29 +93,27 @@ function readVarint(buf, offset = 0) {
   return null;
 }
 
-function normalizeAt(at) {
+function normalizeAtSeconds(at) {
   if (at == null) return null;
   if (at === "now") return "now";
   try {
-    const value = BigInt(at);
-    const abs = value < 0n ? -value : value;
-    let normalized = abs;
-    if (abs < 1_000_000_000_000n) {
-      normalized = abs * 1000n;
-    }
-    const asNumber =
-      normalized <= BigInt(Number.MAX_SAFE_INTEGER)
-        ? Number(normalized)
-        : normalized;
-    if (typeof asNumber === "number") {
+    const raw = BigInt(at);
+    const isMillis = raw >= 1_000_000_000_000n;
+    const seconds = isMillis ? raw / 1000n : raw;
+    const displayMillis = seconds <= BigInt(Number.MAX_SAFE_INTEGER)
+      ? Number(seconds) * 1000
+      : null;
+
+    if (displayMillis != null) {
       logNico(
-        "normalizeAt",
-        `${at} -> ${normalized.toString()} (${new Date(asNumber).toISOString()})`
+        "normalizeAtSeconds",
+        `${at} -> ${seconds.toString()} (${new Date(displayMillis).toISOString()})`
       );
     } else {
-      logNico("normalizeAt", `${at} -> ${normalized.toString()}`);
+      logNico("normalizeAtSeconds", `${at} -> ${seconds.toString()}`);
     }
-    return normalized.toString();
+
+    return seconds.toString();
   } catch {
     return String(at);
   }
@@ -130,21 +128,24 @@ function createChunkProcessor(label, onPayload) {
     while (buffer.length) {
       const lengthInfo = readVarint(buffer, 0);
       if (!lengthInfo) break;
-      const payloadLength = Number(lengthInfo.value);
-      const varintLength = lengthInfo.length;
-      const totalLength = varintLength + payloadLength;
-      if (buffer.length < totalLength) break;
 
-      if (payloadLength < 1) {
-        buffer = buffer.slice(totalLength);
-        continue;
+      const headerLen = lengthInfo.length;
+      const msgLen = Number(lengthInfo.value);
+
+      if (!Number.isFinite(msgLen) || msgLen < 0) {
+        logNico(`invalid ${label} frame length`, msgLen);
+        buffer = Buffer.alloc(0);
+        break;
       }
 
-      const payload = buffer.slice(varintLength, totalLength);
+      const totalLength = headerLen + msgLen;
+      if (buffer.length < totalLength) break;
+
+      const payload = buffer.slice(headerLen, totalLength);
       const rawChunk = buffer.slice(0, totalLength);
       buffer = buffer.slice(totalLength);
 
-      onPayload({ payload, rawChunk, payloadLength, varintLength });
+      onPayload({ payload, rawChunk, payloadLength: msgLen, varintLength: headerLen });
     }
   };
 }
@@ -390,23 +391,48 @@ async function connectNiconico(liveUrlOrId) {
     }
   };
 
-  const startSegmentStream = (uri) => {
+  const ensureCursorOrAtParam = (uri, { cursor, at } = {}) => {
+    try {
+      const url = new URL(uri);
+      if (cursor) {
+        url.searchParams.set("cursor", cursor);
+      } else if (at) {
+        url.searchParams.set("at", at);
+      }
+      return url.toString();
+    } catch {
+      const joiner = uri.includes("?") ? "&" : "?";
+      if (cursor) return `${uri}${joiner}cursor=${encodeURIComponent(cursor)}`;
+      if (at) return `${uri}${joiner}at=${encodeURIComponent(at)}`;
+      return uri;
+    }
+  };
+
+  let lastSegmentCursor = null;
+
+  const startSegmentStream = (uri, options = {}) => {
     if (!uri || connectionAbortController.signal.aborted) return;
-    if (segmentConnections.has(uri)) return;
+
+    if (options.cursor) {
+      lastSegmentCursor = options.cursor;
+    }
+
+    const targetUri = ensureCursorOrAtParam(uri, options);
+    if (segmentConnections.has(targetUri)) return;
 
     const controller = new AbortController();
     const state = { controller, promise: null };
-    segmentConnections.set(uri, state);
+    segmentConnections.set(targetUri, state);
 
     state.promise = (async () => {
       let firstMessageLogged = false;
       let firstPayloadLogged = false;
 
       try {
-        logNico("segmentServer uri", uri);
-        setStatus(`segment 接続開始 ${uri}`);
+        logNico("segmentServer uri", targetUri);
+        setStatus(`segment 接続開始 ${targetUri}`);
 
-        const response = await fetch(uri, {
+        const response = await fetch(targetUri, {
           signal: controller.signal,
           headers: {
             "User-Agent": "komebyu/1.0 (+https://github.com/)",
@@ -461,10 +487,18 @@ async function connectNiconico(liveUrlOrId) {
                 });
               }
 
-              if (msg?.reconnect?.streamUrl) {
-                const normalizedAt = normalizeAt(msg.reconnect.at) || "now";
-                const nextUri = ensureAtParam(msg.reconnect.streamUrl, normalizedAt);
-                startSegmentStream(nextUri);
+              if (msg?.reconnect) {
+                if (msg.reconnect.cursor) {
+                  lastSegmentCursor = msg.reconnect.cursor;
+                }
+
+                if (msg.reconnect.streamUrl) {
+                  const normalizedAt = normalizeAtSeconds(msg.reconnect.at);
+                  startSegmentStream(msg.reconnect.streamUrl, {
+                    cursor: msg.reconnect.cursor || lastSegmentCursor,
+                    at: normalizedAt || undefined,
+                  });
+                }
               }
             }
           } catch (err) {
@@ -488,7 +522,7 @@ async function connectNiconico(liveUrlOrId) {
           setStatus(`segment エラー: ${e?.message || String(e)}`);
         }
       } finally {
-        segmentConnections.delete(uri);
+        segmentConnections.delete(targetUri);
       }
     })();
   };
@@ -497,13 +531,14 @@ async function connectNiconico(liveUrlOrId) {
     let targetBase = initialBase;
     let nextStreamAt = "now";
     let reconnectDelay = 1000;
+    let viewErrorBackoff = 500;
 
     while (!connectionAbortController.signal.aborted && targetBase) {
       if (viewAbort) viewAbort.abort();
       viewAbort = new AbortController();
       const localAbort = viewAbort;
       let updatedDuringStream = false;
-      const atValue = normalizeAt(nextStreamAt) || "now";
+      const atValue = normalizeAtSeconds(nextStreamAt) || "now";
       const targetUrl = ensureAtParam(targetBase, atValue);
       let firstChunkLogged = false;
       let firstPayloadLogged = false;
@@ -524,13 +559,21 @@ async function connectNiconico(liveUrlOrId) {
         });
 
         if (!response.ok || !response.body) {
-          setStatus(`view/v4 取得失敗 (${response.status})`);
           if (response.status === 422) {
+            setStatus(
+              `view/v4 取得失敗 (${response.status}), ${viewErrorBackoff}ms 後に再試行`
+            );
+            await new Promise((resolve) => setTimeout(resolve, viewErrorBackoff));
+            viewErrorBackoff = Math.min(viewErrorBackoff * 2, 2000);
             nextStreamAt = "now";
             continue;
           }
+
+          setStatus(`view/v4 取得失敗 (${response.status})`);
           break;
         }
+
+        viewErrorBackoff = 500;
 
         const reader = response.body.getReader();
         const processChunk = createChunkProcessor("view", ({
@@ -576,7 +619,7 @@ async function connectNiconico(liveUrlOrId) {
               }
 
               if (entry?.reconnect?.at != null) {
-                const normalized = normalizeAt(entry.reconnect.at) || atValue;
+                const normalized = normalizeAtSeconds(entry.reconnect.at) || atValue;
                 nextStreamAt = normalized;
                 updatedDuringStream = true;
                 logNico("view reconnect.at", normalized);
@@ -587,7 +630,7 @@ async function connectNiconico(liveUrlOrId) {
               }
 
               if (entry?.next?.at != null) {
-                const normalized = normalizeAt(entry.next.at) || atValue;
+                const normalized = normalizeAtSeconds(entry.next.at) || atValue;
                 nextStreamAt = normalized;
                 updatedDuringStream = true;
                 if (entry.next.uri) {
@@ -603,8 +646,14 @@ async function connectNiconico(liveUrlOrId) {
               }
 
               if (entry?.reconnect?.streamUrl) {
-                const at = normalizeAt(entry.reconnect.at) || "now";
-                startSegmentStream(ensureAtParam(entry.reconnect.streamUrl, at));
+                const at = normalizeAtSeconds(entry.reconnect.at) || "now";
+                if (entry.reconnect.cursor) {
+                  lastSegmentCursor = entry.reconnect.cursor;
+                }
+                startSegmentStream(entry.reconnect.streamUrl, {
+                  cursor: entry.reconnect.cursor || lastSegmentCursor,
+                  at,
+                });
               }
             }
           } catch (e) {
